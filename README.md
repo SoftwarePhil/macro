@@ -113,6 +113,18 @@ npm run job:open
 npm run job:close
 ```
 
+**XAI API key requirement (for direct LLM calls in the daily job):**
+
+The install script reads your xAI API key from a gitignored file:
+
+```bash
+# Create the key file (one line, your actual key)
+echo 'xai-yourkeyhere' > data/xai_api_key.txt
+chmod 600 data/xai_api_key.txt
+```
+
+Then run `npm run schedule:install`. The script will inject the key into the LaunchAgent plists (the source templates in `scripts/launchd/` always use a placeholder and are safe to commit).
+
 After setting up locally, re-run `npm run schedule:install` (from inside the project dir) so the LaunchAgent plists point at the correct path on this machine. Note: our local folder is named `macro` (GitHub repo name) rather than `regime-dashboard`.
 
 Reports are written to `logs/reports/`. The strategy log is appended at `../strategy_log.csv` (parent of this repo, also gitignored).
@@ -167,8 +179,9 @@ regime-dashboard/
 - Local portfolio / paper-trading state (`data/paper_*`, `data/portfolio.json`)
 - Runtime logs and backups (`logs/`)
 - Parent-level `strategy_log.csv`
+- `data/xai_api_key.txt` (your xAI key for launchd – read by install script at install time)
 
-`.gitignore` covers these paths. If you add env-based config later, use a `.env` file (also ignored) and keep secrets out of source.
+`.gitignore` covers these paths. The xAI key is stored in `data/xai_api_key.txt` (gitignored) and injected into the launchd plists by `scripts/install_schedule.sh` when you run the install. The source plist templates in `scripts/launchd/` contain only a placeholder.
 
 Robinhood MCP / Agentic account integration is configured separately in Grok — not in this repository.
 

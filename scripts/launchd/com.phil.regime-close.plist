@@ -42,7 +42,7 @@
   <dict>
     <key>TZ</key>
     <string>America/New_York</string>
-    <!-- Direct Grok calls from the daily script require this key -->
+    <!-- XAI_API_KEY is injected at install time by install_schedule.sh from data/xai_api_key.txt (gitignored) -->
     <key>XAI_API_KEY</key>
     <string>REPLACE_WITH_YOUR_XAI_API_KEY</string>
   </dict>
