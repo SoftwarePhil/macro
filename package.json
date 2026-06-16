@@ -11,10 +11,12 @@
     "schedule:install": "bash scripts/install_schedule.sh",
     "paper:init": "python3 scripts/paper_trade.py --init",
     "paper:reset": "bash scripts/reset_for_tomorrow.sh",
+    "db:migrate": "python3 scripts/migrate_to_sqlite.py",
     "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {
+    "better-sqlite3": "^12.11.1",
     "cors": "^2.8.5",
     "express": "^4.21.2"
   },

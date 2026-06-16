@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import re
@@ -17,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+
+import db as _db
 from paper_trade import (  # noqa: E402
     execute_rebalance,
     is_enabled as paper_enabled,
@@ -24,8 +25,7 @@ from paper_trade import (  # noqa: E402
     portfolio_value as paper_portfolio_value,
     portfolio_weights as paper_portfolio_weights,
 )
-HOME = ROOT.parent
-STRATEGY_LOG = HOME / "strategy_log.csv"
+
 PORTFOLIO_PATH = ROOT / "data" / "portfolio.json"
 TIERS_PATH = ROOT / "data" / "tiers.json"
 REPORTS_DIR = ROOT / "logs" / "reports"
@@ -35,47 +35,50 @@ ASSETS = ["QQQ", "USO", "GLD"]
 QUOTE_SYMBOLS = ["QQQ", "USO", "GLD", "^VIX", "CL=F", "GC=F", "BTC-USD"]
 SESSIONS = {"open", "close"}
 
-FIELDNAMES = [
-    "Date",
-    "Session",
-    "Regime_Tier",
-    "Recommended_QQQ_%",
-    "Recommended_USO_%",
-    "Recommended_GLD_%",
-    "Current_Portfolio_Value",
-    "QQQ_Price",
-    "USO_Price",
-    "GLD_Price",
-    "Rationale_Summary",
-    "Gold_Oil_Ratio",
-    "Key_Signals",
-    "Suggested_Action",
-    "Rebalance_Note",
-]
+ET_TZ = ZoneInfo("America/New_York")
 
-ET = ZoneInfo("America/New_York")
+# How old a cached quote can be before we force a fresh Yahoo fetch (seconds)
+QUOTE_MAX_AGE_S = 8 * 60  # 8 minutes
 
 
-def load_live_quotes() -> dict:
-    p = ROOT / "data" / "live_quotes.json"
-    if not p.exists():
-        return {}
+# ---------------------------------------------------------------------------
+# Quote fetching — writes to DB, reads from DB as cache
+# ---------------------------------------------------------------------------
+
+def _live_quote_from_db(symbol: str) -> dict | None:
+    """
+    Return a cached quote row if it exists, is from MCP, and is fresh.
+    MCP prices are never auto-expired here — they were explicitly pushed.
+    The staleness guard is only for Yahoo-sourced rows.
+    """
+    conn = _db.get_conn()
+    row = conn.execute(
+        "SELECT * FROM quotes WHERE symbol=?", (symbol,)
+    ).fetchone()
+    if row is None:
+        return None
+    row = dict(row)
+    if row["source"] == "mcp":
+        # MCP prices: trust them (they were explicitly pushed by the operator)
+        return row
+    # Yahoo prices: check age
     try:
-        return json.loads(p.read_text())
+        age = (datetime.now(ET_TZ) - datetime.fromisoformat(row["fetched_at"])).total_seconds()
+        if age > QUOTE_MAX_AGE_S:
+            return None
     except Exception:
-        return {}
+        return None
+    return row
+
 
 def fetch_quote(symbol: str) -> dict:
-    live = load_live_quotes()
-    entry = live.get(symbol) or live.get(symbol.upper())
-    if entry is not None:
-        price = entry["price"] if isinstance(entry, dict) else entry
-        change_pct = (entry.get("change_pct") or entry.get("changePct") or 0) if isinstance(entry, dict) else 0
+    cached = _live_quote_from_db(symbol)
+    if cached:
         return {
             "symbol": symbol,
-            "price": round(float(price), 2),
-            "change_pct": round(float(change_pct), 2),
-            "market_state": "LIVE_ROBINHOOD_MCP",
+            "price": round(float(cached["price"]), 2),
+            "change_pct": round(float(cached["change_pct"]), 2),
+            "market_state": cached["market_state"],
         }
 
     url = (
@@ -104,8 +107,14 @@ def fetch_quotes() -> dict[str, dict]:
             quotes[sym] = fetch_quote(sym)
         except Exception as exc:  # noqa: BLE001
             print(f"warn: quote failed for {sym}: {exc}", file=sys.stderr)
+    # Persist all fetched quotes to DB (Yahoo-sourced ones update fetched_at)
+    _db.upsert_quotes_batch(quotes)
     return quotes
 
+
+# ---------------------------------------------------------------------------
+# Portfolio helpers
+# ---------------------------------------------------------------------------
 
 def load_portfolio() -> dict:
     if paper_enabled():
@@ -138,57 +147,21 @@ def portfolio_weights(portfolio: dict, quotes: dict) -> dict[str, float]:
     return {sym: round(values[sym] / total * 100, 1) for sym in ASSETS}
 
 
-def load_log_rows() -> list[dict]:
-    if not STRATEGY_LOG.exists():
-        return []
-    with STRATEGY_LOG.open(newline="") as f:
-        return list(csv.DictReader(f))
+# ---------------------------------------------------------------------------
+# Strategy log
+# ---------------------------------------------------------------------------
+
+def load_log_rows(tab_id: str = "paper") -> list[dict]:
+    return _db.load_strategy_log(tab_id)
 
 
-def ensure_log_header() -> None:
-    if not STRATEGY_LOG.exists():
-        with STRATEGY_LOG.open("w", newline="") as f:
-            csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
-        return
-    with STRATEGY_LOG.open(newline="") as f:
-        rows = list(csv.reader(f))
-    if not rows:
-        with STRATEGY_LOG.open("w", newline="") as f:
-            csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
-        return
-    header = rows[0]
-    if header == FIELDNAMES:
-        return
-    # migrate legacy header
-    legacy = rows[0]
-    body = rows[1:]
-    mapped = []
-    for line in body:
-        row = dict(zip(legacy, line))
-        mapped.append(
-            {
-                "Date": row.get("Date", ""),
-                "Session": row.get("Session", "Close"),
-                "Regime_Tier": row.get("Regime_Tier", ""),
-                "Recommended_QQQ_%": row.get("Recommended_QQQ_%", ""),
-                "Recommended_USO_%": row.get("Recommended_USO_%", ""),
-                "Recommended_GLD_%": row.get("Recommended_GLD_%", ""),
-                "Current_Portfolio_Value": row.get("Current_Portfolio_Value", ""),
-                "QQQ_Price": row.get("QQQ_Price", ""),
-                "USO_Price": row.get("USO_Price", ""),
-                "GLD_Price": row.get("GLD_Price", ""),
-                "Rationale_Summary": row.get("Rationale_Summary", ""),
-                "Gold_Oil_Ratio": row.get("Gold_Oil_Ratio", ""),
-                "Key_Signals": row.get("Key_Signals", ""),
-                "Suggested_Action": row.get("Suggested_Action", "Hold"),
-                "Rebalance_Note": row.get("Rebalance_Note", ""),
-            }
-        )
-    with STRATEGY_LOG.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(mapped)
+def append_log_row(row: dict, tab_id: str = "paper") -> None:
+    _db.insert_strategy_log(row, tab_id)
 
+
+# ---------------------------------------------------------------------------
+# Regime logic
+# ---------------------------------------------------------------------------
 
 def find_previous(rows: list[dict], today: str, session: str) -> dict | None:
     session_rank = {"Open": 0, "Close": 1}
@@ -201,7 +174,6 @@ def find_previous(rows: list[dict], today: str, session: str) -> dict | None:
     prior = [r for r in rows if r.get("Date", "") < today]
     if not prior:
         return None
-    # latest prior date, prefer Close over Open
     latest_date = max(r["Date"] for r in prior)
     day_rows = [r for r in prior if r["Date"] == latest_date]
     for sess in ("Close", "Open"):
@@ -211,8 +183,13 @@ def find_previous(rows: list[dict], today: str, session: str) -> dict | None:
     return day_rows[-1]
 
 
-def score_regime(quotes: dict) -> tuple[int, str, list[str]]:
-    """Return (tier, confidence_label, signal_list)."""
+def score_regime(quotes: dict) -> tuple[int, float, list[str]]:
+    """Return (tier, signal_strength_0_to_1, signal_list).
+
+    signal_strength is a 0–1 score indicating how strongly we're at the
+    extreme of the chosen tier (0.5 = neutral mid-tier, 1.0 = maximum
+    conviction). Used by tier_targets() to pick a point within the range.
+    """
     vix = quotes.get("^VIX", {}).get("price", 20)
     qqq_chg = quotes.get("QQQ", {}).get("change_pct", 0)
     uso_chg = quotes.get("USO", {}).get("change_pct", 0)
@@ -222,6 +199,7 @@ def score_regime(quotes: dict) -> tuple[int, str, list[str]]:
 
     risk_on = 0
     risk_off = 0
+    max_possible = 8  # maximum total risk_on or risk_off score
     signals = []
 
     if vix < 17:
@@ -259,23 +237,150 @@ def score_regime(quotes: dict) -> tuple[int, str, list[str]]:
     signals.append(f"BTC_1D={btc_chg:+.2f}%")
     signals.append(f"WTI={wti}")
 
+    gap = risk_on - risk_off
     if risk_off >= risk_on + 2:
         tier = 3
-        confidence = "high" if risk_off >= risk_on + 3 else "medium"
+        # strength: how far into risk-off range (0.5 = just tipped, 1.0 = maximum)
+        strength = min(1.0, 0.5 + (risk_off - risk_on - 2) / (max_possible * 0.5))
     elif risk_on >= risk_off + 2:
         tier = 1
-        confidence = "high" if risk_on >= risk_off + 3 else "medium"
+        strength = min(1.0, 0.5 + (risk_on - risk_off - 2) / (max_possible * 0.5))
     else:
         tier = 2
-        confidence = "medium"
+        # strength at Tier 2 = 0.5 at center, approaches 0 or 1 at edges
+        strength = 0.5 + gap / 4.0  # ranges roughly 0.25–0.75
 
-    return tier, confidence, signals
+    confidence = "high" if strength >= 0.75 else "medium"
+    return tier, strength, signals
 
 
-def tier_targets(tier: int) -> dict[str, int]:
+def tier_targets(tier: int, strength: float = 0.5) -> dict[str, int]:
+    """Pick concrete targets within the tier's ranges based on signal strength.
+
+    For Tier 1: strength near 1.0 → max QQQ, possibly 0% USO (strong risk-on, no oil).
+    For Tier 3: strength near 1.0 → max GLD, max CASH, min equities.
+    strength is clamped to [0, 1].
+
+    Returns a dict with QQQ, USO, GLD, CASH summing to exactly 100.
+    """
     tiers = json.loads(TIERS_PATH.read_text())
     t = tiers.get(str(tier), tiers["2"])
-    return t["targets"]
+    ranges = t.get("ranges", {})
+    defaults = t["targets"]
+
+    if not ranges:
+        return defaults
+
+    strength = max(0.0, min(1.0, strength))
+
+    # For Tier 1: strength drives toward max QQQ, minimum USO/GLD/CASH
+    # For Tier 3: strength drives toward max GLD/CASH, minimum QQQ/USO
+    # For Tier 2: strength 0.5 → defaults; 0 → more defensive, 1 → more aggressive
+
+    def pick(sym: str, toward_max: bool) -> int:
+        r = ranges.get(sym, {})
+        lo, hi = r.get("min", defaults[sym]), r.get("max", defaults[sym])
+        if toward_max:
+            raw = lo + (hi - lo) * strength
+        else:
+            raw = hi - (hi - lo) * strength
+        return int(round(raw))
+
+    if tier == 1:
+        # High strength = strong risk-on: max QQQ, minimal oil and gold and cash
+        qqq  = pick("QQQ",  toward_max=True)
+        uso  = pick("USO",  toward_max=False)
+        gld  = pick("GLD",  toward_max=False)
+        cash = pick("CASH", toward_max=False)
+    elif tier == 3:
+        # High strength = strong risk-off: max GLD, max cash, minimal equities
+        gld  = pick("GLD",  toward_max=True)
+        cash = pick("CASH", toward_max=True)
+        qqq  = pick("QQQ",  toward_max=False)
+        uso  = pick("USO",  toward_max=False)
+    else:
+        # Tier 2: use defaults, nudge slightly by strength (strength > 0.5 = slight risk-on lean)
+        qqq  = pick("QQQ",  toward_max=(strength >= 0.5))
+        uso  = pick("USO",  toward_max=False)
+        gld  = pick("GLD",  toward_max=(strength < 0.5))
+        cash = pick("CASH", toward_max=(strength < 0.5))
+
+    # Clamp all to their stated ranges and ensure non-negative
+    def clamp(sym: str, val: int) -> int:
+        r = ranges.get(sym, {})
+        return max(r.get("min", 0), min(r.get("max", 100), max(0, val)))
+
+    qqq, uso, gld, cash = clamp("QQQ", qqq), clamp("USO", uso), clamp("GLD", gld), clamp("CASH", cash)
+
+    # Reconcile to exactly 100 by adjusting in priority order.
+    # Priority: absorbers are listed first; USO is listed last so a deliberate USO=0 is not overridden.
+    # For Tier 1: CASH is the preferred absorber (keeps USO/GLD/QQQ at their signal-driven values).
+    # For Tier 3: CASH is the preferred absorber.
+    # For Tier 2: QQQ absorbs first.
+    if tier == 1:
+        absorbers = ["CASH", "QQQ", "GLD", "USO"]
+    elif tier == 3:
+        absorbers = ["CASH", "GLD", "QQQ", "USO"]
+    else:
+        absorbers = ["QQQ", "CASH", "GLD", "USO"]
+
+    total = qqq + uso + gld + cash
+    diff = 100 - total
+    if diff != 0:
+        vals = {"QQQ": qqq, "USO": uso, "GLD": gld, "CASH": cash}
+        for sym_name in absorbers:
+            r = ranges.get(sym_name, {})
+            adjusted = vals[sym_name] + diff
+            lo = r.get("min", 0)
+            # Absorbers are allowed to exceed their stated max by up to 20% to reconcile
+            hi = r.get("max", 100) + 20
+            if lo <= adjusted <= hi:
+                vals[sym_name] = max(0, adjusted)
+                break
+        else:
+            vals["CASH"] = max(0, vals["CASH"] + diff)
+        qqq, uso, gld, cash = vals["QQQ"], vals["USO"], vals["GLD"], vals["CASH"]
+
+    return {"QQQ": qqq, "USO": uso, "GLD": gld, "CASH": cash}
+
+
+def validate_targets(targets: dict) -> dict:
+    """Validate and sanitise a targets dict (e.g. from LLM output).
+
+    Rules:
+    - All values must be >= 0
+    - CASH is added implicitly if missing (remainder to 100)
+    - Total across QQQ+USO+GLD+CASH must equal 100 (±1 rounding tolerance)
+    - Returns a cleaned dict, or raises ValueError if unrecoverable.
+    """
+    clean = {}
+    for sym in ASSETS:
+        v = targets.get(sym, 0)
+        if v < 0:
+            raise ValueError(f"Target for {sym} is negative: {v}")
+        clean[sym] = int(round(float(v)))
+
+    asset_sum = sum(clean[s] for s in ASSETS)
+
+    # Handle explicit CASH key
+    cash_explicit = targets.get("CASH")
+    if cash_explicit is not None:
+        cash = int(round(float(cash_explicit)))
+        if cash < 0:
+            raise ValueError(f"Target for CASH is negative: {cash}")
+        total = asset_sum + cash
+        if abs(total - 100) > 2:
+            raise ValueError(f"Targets sum to {total}, must be 100 (±2): {targets}")
+        # Absorb rounding into CASH
+        clean["CASH"] = cash + (100 - total)
+    else:
+        # Infer CASH as remainder
+        cash = 100 - asset_sum
+        if cash < 0:
+            raise ValueError(f"Asset targets sum to {asset_sum} > 100: {targets}")
+        clean["CASH"] = cash
+
+    return clean
 
 
 def suggest_action(
@@ -285,7 +390,16 @@ def suggest_action(
     previous: dict | None,
     tier: int,
 ) -> tuple[str, str]:
-    drifts = {sym: round(weights.get(sym, 0) - targets[sym], 1) for sym in ASSETS}
+    # Compute cash weight as 100 - sum(invested assets)
+    cash_actual = round(max(0.0, 100.0 - sum(weights.get(s, 0) for s in ASSETS)), 1)
+    all_targets = {**targets}
+    if "CASH" not in all_targets:
+        all_targets["CASH"] = 0
+
+    all_symbols = ASSETS + ["CASH"]
+    actual_map = {**{s: round(weights.get(s, 0), 1) for s in ASSETS}, "CASH": cash_actual}
+
+    drifts = {sym: round(actual_map.get(sym, 0) - all_targets[sym], 1) for sym in all_symbols}
     max_drift = max(abs(v) for v in drifts.values())
     has_positions = any(abs(weights.get(sym, 0)) > 0.01 for sym in ASSETS)
 
@@ -299,12 +413,14 @@ def suggest_action(
         return "Hold", note
 
     moves = []
-    for sym in ASSETS:
+    for sym in all_symbols:
         drift = drifts[sym]
         if abs(drift) <= 5:
             continue
         step = min(abs(drift), 10)
-        direction = "trim" if drift > 0 else "add"
+        direction = "trim" if drift > 0 else ("hold cash" if sym == "CASH" and drift < 0 else "add")
+        if sym == "CASH":
+            direction = "reduce cash" if drift > 0 else "build cash buffer"
         moves.append(f"{direction} {sym} ~{step:.0f}%")
 
     action = "Rebalance"
@@ -322,22 +438,24 @@ def build_rationale(tier: int, confidence: str, session: str, signals: list[str]
     )
 
 
-def append_log_row(row: dict) -> None:
-    ensure_log_header()
-    with STRATEGY_LOG.open("a", newline="") as f:
-        csv.DictWriter(f, fieldnames=FIELDNAMES).writerow(row)
+# ---------------------------------------------------------------------------
+# LLM + reporting
+# ---------------------------------------------------------------------------
 
-
-def write_report(text: str, today: str, session: str) -> Path:
+def write_report(text: str, today: str, session: str,
+                 tab_id: str = "paper") -> Path:
+    """Write report to DB and also to disk (for backward compat / human reading)."""
+    filename = f"{today}_{session}.md"
+    _db.upsert_llm_report(tab_id, today, session, text, filename)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = REPORTS_DIR / f"{today}_{session}.md"
+    path = REPORTS_DIR / filename
     path.write_text(text)
     return path
 
 
 def log_job(message: str) -> None:
     JOBS_LOG.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S %Z")
+    stamp = datetime.now(ET_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
     with JOBS_LOG.open("a") as f:
         f.write(f"[{stamp}] {message}\n")
 
@@ -362,7 +480,6 @@ def fetch_news_headlines(limit: int = 6) -> list[str]:
         with urllib.request.urlopen(req, timeout=12) as resp:
             data = resp.read()
         text = data.decode("utf-8", errors="ignore")
-        # Prefer XML parse
         try:
             root = ET.fromstring(data)
             for item in root.findall(".//item")[: limit * 2]:
@@ -380,9 +497,8 @@ def fetch_news_headlines(limit: int = 6) -> list[str]:
                     if title_el is not None and title_el.text:
                         headlines.append(title_el.text.strip())
         except Exception:
-            # Regex fallback on titles (channel title is first)
             titles = re.findall(r"<title>([^<]+)</title>", text)
-            for t in titles[1 : limit + 1]:
+            for t in titles[1: limit + 1]:
                 headlines.append(t.strip())
     except Exception as exc:  # noqa: BLE001
         print(f"warn: news fetch failed: {exc}", file=sys.stderr)
@@ -397,10 +513,10 @@ def call_xai_for_report(
     headlines: list[str],
     system_prompt: str,
 ) -> str:
-    """Call Grok directly via xAI API (no extra deps). Requires XAI_API_KEY in env."""
+    """Call Grok directly via xAI API. Requires XAI_API_KEY in env."""
     api_key = os.environ.get("XAI_API_KEY") or os.environ.get("xai_api_key")
     if not api_key:
-        return "LLM_CALL_SKIPPED: no XAI_API_KEY in environment. Export it before the job for direct calls from the script."
+        return "LLM_CALL_SKIPPED: no XAI_API_KEY in environment."
     model = os.environ.get("XAI_MODEL", "grok-3-latest")
     base_url = "https://api.x.ai/v1/chat/completions"
 
@@ -415,7 +531,8 @@ def call_xai_for_report(
         user_content += "RECENT_NEWS_HEADLINES:\n" + "\n".join(f"- {h}" for h in headlines) + "\n\n"
     user_content += (
         "Embody the full agent prompt. Generate the Daily 3-Tier Regime Report. "
-        "Use news context for richer rationale. At the end include the exact machine-readable ```json block with tier/targets/action/trades (empty trades list if Hold)."
+        "Use news context for richer rationale. At the end include the exact machine-readable "
+        "```json block with tier/targets/action/trades (empty trades list if Hold)."
     )
 
     payload = {
@@ -444,7 +561,7 @@ def call_xai_for_report(
         content = resp_data["choices"][0]["message"]["content"]
         return content.strip()
     except Exception as exc:  # noqa: BLE001
-        return f"LLM_CALL_ERROR: {exc}\n(Direct Grok call from script failed; using quant fallback. Verify key and connectivity.)"
+        return f"LLM_CALL_ERROR: {exc}"
 
 
 def parse_llm_trades(text: str) -> list[dict]:
@@ -467,26 +584,30 @@ def parse_llm_trades(text: str) -> list[dict]:
         return []
 
 
+# ---------------------------------------------------------------------------
+# Main run
+# ---------------------------------------------------------------------------
+
 def run(session: str) -> int:
     session = session.lower()
     if session not in SESSIONS:
         print(f"Invalid session: {session}", file=sys.stderr)
         return 1
 
-    now = datetime.now(ET)
+    now = datetime.now(ET_TZ)
     today = now.strftime("%Y-%m-%d")
     session_label = session.capitalize()
 
-    # Minimal tab awareness from config list (paper + real)
+    # Minimal tab awareness from DB
     try:
-        cfg_raw = json.loads((ROOT / "data" / "paper_config.json").read_text() or "[]")
-        tab_list = cfg_raw if isinstance(cfg_raw, list) else [cfg_raw]
-        tab_ids = [t.get("id") for t in tab_list]
+        tab_list = _db.load_tab_config()
+        tab_ids = [t.get("tab_id") for t in tab_list]
         log_job(f"config tabs: {tab_ids}")
     except Exception:
         tab_list = []
         log_job("config tabs: load failed (using paper fallback)")
 
+    # Fetch fresh quotes — Yahoo for stale/missing, DB cache for fresh MCP prices
     quotes = fetch_quotes()
     if not all(sym in quotes for sym in ASSETS):
         log_job(f"FAIL {session_label}: missing core quotes")
@@ -495,10 +616,11 @@ def run(session: str) -> int:
     portfolio = load_portfolio()
     total_value = portfolio_value(portfolio, quotes)
     weights = portfolio_weights(portfolio, quotes)
-    rows = load_log_rows()
+    rows = load_log_rows("paper")
 
-    tier, confidence, signals = score_regime(quotes)
-    targets = tier_targets(tier)
+    tier, strength, signals = score_regime(quotes)
+    confidence = "high" if strength >= 0.75 else "medium"
+    targets = tier_targets(tier, strength)
     previous = find_previous(rows, today, session_label)
     action, rebalance_note = suggest_action(session_label, weights, targets, previous, tier)
 
@@ -522,13 +644,14 @@ def run(session: str) -> int:
     wti = quotes.get("CL=F", {}).get("price", 0)
     gold_oil = round(gold_spot / wti, 2) if gold_spot and wti else ""
 
-    row = {
+    log_row = {
         "Date": today,
         "Session": session_label,
         "Regime_Tier": tier,
         "Recommended_QQQ_%": targets["QQQ"],
         "Recommended_USO_%": targets["USO"],
         "Recommended_GLD_%": targets["GLD"],
+        "Recommended_CASH_%": targets.get("CASH", 0),
         "Current_Portfolio_Value": total_value if total_value else "",
         "QQQ_Price": quotes["QQQ"]["price"],
         "USO_Price": quotes["USO"]["price"],
@@ -539,7 +662,7 @@ def run(session: str) -> int:
         "Suggested_Action": action,
         "Rebalance_Note": rebalance_note,
     }
-    append_log_row(row)
+    append_log_row(log_row, "paper")
 
     prev_line = ""
     if previous:
@@ -565,6 +688,7 @@ def run(session: str) -> int:
 | QQQ | {targets['QQQ']}% |
 | USO | {targets['USO']}% |
 | GLD | {targets['GLD']}% |
+| CASH | {targets.get('CASH', 0)}% |
 
 ## Portfolio
 - Value: ${total_value:,.0f}
@@ -579,10 +703,9 @@ def run(session: str) -> int:
 - Gold/Oil {gold_oil}
 
 ## Rationale
-{row['Rationale_Summary']}
+{log_row['Rationale_Summary']}
 """
 
-    # === Direct call to Grok from the script (no pasting) ===
     agent_prompt = load_agent_prompt()
     headlines = fetch_news_headlines()
     llm_structured = {
@@ -604,7 +727,7 @@ def run(session: str) -> int:
     }
     llm_text = call_xai_for_report("paper", session_label, llm_structured, previous, headlines, agent_prompt)
 
-    # If LLM suggested specific trades, apply them (LLM can steer beyond pure quant)
+    # If LLM suggested specific trades, apply them (with validation)
     llm_trades = parse_llm_trades(llm_text)
     if llm_trades and paper_enabled():
         llm_tier = tier
@@ -616,9 +739,12 @@ def run(session: str) -> int:
                 if isinstance(obj.get("tier"), int):
                     llm_tier = int(obj["tier"])
                 if isinstance(obj.get("targets"), dict):
-                    llm_targets = {k: int(v) for k, v in obj["targets"].items() if k in ASSETS}
-        except Exception:
-            pass
+                    raw = {k: v for k, v in obj["targets"].items()
+                           if k in ASSETS + ["CASH"]}
+                    llm_targets = validate_targets(raw)
+        except (ValueError, Exception) as e:
+            log_job(f"LLM targets rejected ({e}); using quant targets")
+            llm_targets = targets
         portfolio, extra = execute_rebalance(portfolio, quotes, llm_targets, session_label, llm_tier, "Rebalance")
         if extra:
             parts = [f"{t['Side']} {t['Symbol']} ${t['Notional']:,.0f}" for t in extra]
@@ -626,33 +752,30 @@ def run(session: str) -> int:
             total_value = paper_portfolio_value(portfolio, quotes)
             weights = paper_portfolio_weights(portfolio, quotes)
 
-    # Prefer the direct LLM report; fall back to quant if call was skipped/errored
     if llm_text.startswith("LLM_CALL_SKIPPED") or llm_text.startswith("LLM_CALL_ERROR"):
         report = quant_report
         log_job(f"LLM fallback for {session_label} (no key or error)")
     else:
         report = llm_text
 
-    report_path = write_report(report, today, session)
+    report_path = write_report(report, today, session, "paper")
     paper_tag = " paper=on" if paper_enabled() else ""
     llm_tag = " llm=direct" if not llm_text.startswith("LLM_") else " llm=skipped"
     log_job(f"OK {session_label}: tier={tier} action={action}{paper_tag}{llm_tag} report={report_path.name}")
     print(report)
 
-    # Debug structured (for transparency / future multi-tab)
     print("\nSTRUCTURED_DATA_FOR_PROMPT:")
     print(json.dumps(llm_structured, indent=2))
 
-    # Also generate a direct LLM report for the "real" tab (non-trading for now, just the intelligence layer + news)
-    # This ensures every scheduled run calls Grok directly for all configured tabs.
+    # Generate report for "real" tab
     try:
-        real_tab = next((t for t in tab_list if t.get("id") == "real"), None)
+        real_tab = next((t for t in tab_list if t.get("tab_id") == "real"), None)
         if real_tab:
             real_p = ROOT / "data" / "real_portfolio.json"
             real_port = {"cash": 0, "holdings": []}
             if real_p.exists():
                 real_port = json.loads(real_p.read_text())
-            real_val = portfolio_value(real_port, quotes)  # reuse the local func (works for any)
+            real_val = portfolio_value(real_port, quotes)
             real_w = portfolio_weights(real_port, quotes)
             real_struct = {
                 "date": today,
@@ -673,12 +796,16 @@ def run(session: str) -> int:
             }
             real_llm = call_xai_for_report("real", session_label, real_struct, previous, headlines, agent_prompt)
             if not real_llm.startswith("LLM_"):
-                real_report_path = write_report(real_llm, today, f"{session}_real")
+                real_report_path = write_report(real_llm, today, f"{session}_real", "real")
                 log_job(f"OK {session_label}: real tab LLM report written ({real_report_path.name})")
             else:
-                # still write a minimal real report so the tab has something
-                real_fallback = f"# Daily 3-Tier Regime Report — {today} ({session_label}) — real tab\n\n(Direct LLM call skipped or errored; using quant signals.)\n\n## Regime\n- Tier {tier}\n\n## Allocation targets\n{targets}\n\n## Current real portfolio value\n${real_val:,.0f}\n"
-                write_report(real_fallback, today, f"{session}_real")
+                real_fallback = (
+                    f"# Daily 3-Tier Regime Report — {today} ({session_label}) — real tab\n\n"
+                    "(Direct LLM call skipped or errored; using quant signals.)\n\n"
+                    f"## Regime\n- Tier {tier}\n\n## Allocation targets\n{targets}\n\n"
+                    f"## Current real portfolio value\n${real_val:,.0f}\n"
+                )
+                write_report(real_fallback, today, f"{session}_real", "real")
     except Exception as e:
         log_job(f"real tab report skipped: {e}")
 

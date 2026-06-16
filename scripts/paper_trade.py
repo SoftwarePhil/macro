@@ -1,61 +1,54 @@
 #!/usr/bin/env python3
-"""Paper trading engine for 3-tier regime strategy."""
+"""Paper trading engine for 3-tier regime strategy — SQLite backend."""
 
 from __future__ import annotations
 
-import csv
-import json
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = ROOT / "data" / "paper_config.json"
-PORTFOLIO_PATH = ROOT / "data" / "paper_portfolio.json"
-TRADES_PATH = ROOT / "data" / "paper_trades.csv"
-EQUITY_PATH = ROOT / "data" / "paper_equity.csv"
-
-ASSETS = ["QQQ", "USO", "GLD"]
 ET = ZoneInfo("America/New_York")
 
-TRADE_FIELDS = [
-    "Timestamp",
-    "Date",
-    "Session",
-    "Symbol",
-    "Side",
-    "Shares",
-    "Price",
-    "Notional",
-    "Reason",
-]
+ASSETS = ["QQQ", "USO", "GLD"]
+TAB_ID = "paper"
 
-EQUITY_FIELDS = [
-    "Date",
-    "Session",
-    "Total_Value",
-    "Cash",
-    "QQQ_pct",
-    "USO_pct",
-    "GLD_pct",
-    "Return_pct",
-    "Tier",
-]
+import sys
+sys.path.insert(0, str(ROOT / "scripts"))
+import db as _db
 
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
 
 def load_config() -> dict:
-    if not CONFIG_PATH.exists():
+    conn = _db.get_conn()
+    tabs = _db.load_tab_config(conn)
+    paper = next((t for t in tabs if t.get("tab_id") == "paper"), None)
+    if paper is None:
         return {"enabled": False}
-    data = json.loads(CONFIG_PATH.read_text())
-    if isinstance(data, list):
-        paper_tab = next((t for t in data if t.get("id") == "paper" or t.get("type") == "paper"), {})
-        return {**paper_tab, "enabled": paper_tab.get("enabled", False)}
-    return data
+    return {
+        "id": paper["tab_id"],
+        "tab_id": paper["tab_id"],
+        "label": paper.get("label", "Paper"),
+        "type": paper.get("type", "paper"),
+        "enabled": bool(paper.get("enabled")),
+        "real_trading_enabled": bool(paper.get("real_trading_enabled")),
+        "starting_capital": float(paper.get("starting_capital", 0)),
+        "max_step_pct": float(paper.get("max_step_pct", 5)),
+        "use_real_prices": bool(paper.get("use_real_prices")),
+        "started_at": paper.get("started_at"),
+    }
 
 
 def is_enabled() -> bool:
     return bool(load_config().get("enabled"))
 
+
+# ---------------------------------------------------------------------------
+# Portfolio helpers
+# ---------------------------------------------------------------------------
 
 def default_portfolio(starting_capital: float = 100_000.0) -> dict:
     return {
@@ -72,48 +65,60 @@ def default_portfolio(starting_capital: float = 100_000.0) -> dict:
 
 
 def load_portfolio() -> dict:
-    if not PORTFOLIO_PATH.exists():
+    raw = _db.load_portfolio(TAB_ID)
+    # If no portfolio exists yet, return a fresh default
+    if not raw.get("holdings"):
         cfg = load_config()
         return default_portfolio(cfg.get("starting_capital", 100_000))
-    return json.loads(PORTFOLIO_PATH.read_text())
+    return raw
 
 
 def save_portfolio(portfolio: dict) -> None:
-    PORTFOLIO_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PORTFOLIO_PATH.write_text(json.dumps(portfolio, indent=2))
+    _db.save_portfolio(portfolio, TAB_ID)
 
 
-def init_paper(starting_capital: float = 100_000.0, started_at: str | None = None) -> dict:
+# ---------------------------------------------------------------------------
+# Init
+# ---------------------------------------------------------------------------
+
+def init_paper(starting_capital: float = 100_000.0,
+               started_at: str | None = None) -> dict:
     start_date = started_at or datetime.now(ET).strftime("%Y-%m-%d")
-    cfg = [
-        {
-            "id": "paper",
-            "label": "Paper",
-            "type": "paper",
-            "real_trading_enabled": False,
-            "enabled": True,
-            "starting_capital": starting_capital,
-            "max_step_pct": 5,
-            "use_real_prices": False,
-            "started_at": start_date
-        },
-        {
-            "id": "real",
-            "label": "Real (Robinhood)",
-            "type": "robinhood",
-            "real_trading_enabled": False
-        }
-    ]
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    conn = _db.get_conn()
+
+    # Write tab configs
+    _db.upsert_tab_config({
+        "tab_id": "paper",
+        "label": "Paper",
+        "type": "paper",
+        "enabled": True,
+        "real_trading_enabled": False,
+        "starting_capital": starting_capital,
+        "max_step_pct": 5,
+        "use_real_prices": False,
+        "started_at": start_date,
+    }, conn)
+    _db.upsert_tab_config({
+        "tab_id": "real",
+        "label": "Real (Robinhood)",
+        "type": "robinhood",
+        "enabled": False,
+        "real_trading_enabled": False,
+        "starting_capital": 0,
+        "max_step_pct": 5,
+        "use_real_prices": False,
+        "started_at": None,
+    }, conn)
+
     portfolio = default_portfolio(starting_capital)
     portfolio["started_at"] = start_date
-    save_portfolio(portfolio)
-
-    for path, fields in ((TRADES_PATH, TRADE_FIELDS), (EQUITY_PATH, EQUITY_FIELDS)):
-        with path.open("w", newline="") as f:
-            csv.DictWriter(f, fieldnames=fields).writeheader()
+    _db.save_portfolio(portfolio, TAB_ID, conn)
     return portfolio
 
+
+# ---------------------------------------------------------------------------
+# Portfolio math (pure — no I/O)
+# ---------------------------------------------------------------------------
 
 def _holding_map(portfolio: dict) -> dict[str, dict]:
     return {h["symbol"]: h for h in portfolio.get("holdings", [])}
@@ -142,14 +147,9 @@ def portfolio_weights(portfolio: dict, quotes: dict[str, dict]) -> dict[str, flo
     return {sym: round(values[sym] / total * 100, 1) for sym in ASSETS}
 
 
-def _append_csv(path: Path, fields: list[str], row: dict) -> None:
-    exists = path.exists()
-    with path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
-
+# ---------------------------------------------------------------------------
+# Execute rebalance
+# ---------------------------------------------------------------------------
 
 def execute_rebalance(
     portfolio: dict,
@@ -159,7 +159,14 @@ def execute_rebalance(
     tier: int,
     action: str,
 ) -> tuple[dict, list[dict]]:
-    """Execute capped paper trades toward target allocation."""
+    """Execute capped paper trades toward target allocation. All writes are atomic.
+
+    targets may include a 'CASH' key. The CASH target is not traded — it
+    simply reduces the investable budget so that remaining cash stays parked.
+    Example: targets = {QQQ:60, USO:0, GLD:25, CASH:15} means 15% of the
+    portfolio is intentionally held as cash and the remaining 85% is deployed
+    across the three ETFs.
+    """
     if action == "Hold":
         return portfolio, []
 
@@ -175,6 +182,21 @@ def execute_rebalance(
         return portfolio, []
 
     max_step = total * max_step_pct / 100
+
+    # The CASH target reserves a fraction of total as uninvested cash.
+    # investable_total is the denominator used to size positions.
+    cash_target_pct = float(targets.get("CASH", 0))
+    investable_pct = max(0.0, 100.0 - cash_target_pct)
+    # Asset targets rescaled to sum to investable_pct
+    # (they already should, but we normalise defensively)
+    asset_sum = sum(targets.get(s, 0) for s in ASSETS)
+    if asset_sum > 0 and abs(asset_sum - investable_pct) > 2:
+        # Targets don't sum correctly with the CASH split — rescale
+        scale = investable_pct / asset_sum
+        effective_targets = {s: round(targets.get(s, 0) * scale) for s in ASSETS}
+    else:
+        effective_targets = {s: targets.get(s, 0) for s in ASSETS}
+
     trades: list[dict] = []
 
     # 1) Sells first (overweight assets)
@@ -185,7 +207,7 @@ def execute_rebalance(
         h = holdings[sym]
         shares = float(h.get("shares") or 0)
         current_val = shares * price
-        target_val = total * targets[sym] / 100
+        target_val = total * effective_targets[sym] / 100
         diff = target_val - current_val
         if diff >= -0.01:
             continue
@@ -197,7 +219,8 @@ def execute_rebalance(
         notional = round(sell_shares * price, 2)
         h["shares"] = round(shares - sell_shares, 4)
         cash += notional
-        trade = {
+        label = f"{targets.get(sym, 0)}%" + (f" [CASH target: {cash_target_pct:.0f}%]" if cash_target_pct else "")
+        trades.append({
             "Timestamp": stamp,
             "Date": today,
             "Session": session,
@@ -206,37 +229,39 @@ def execute_rebalance(
             "Shares": sell_shares,
             "Price": price,
             "Notional": notional,
-            "Reason": f"{action} toward Tier {tier} ({targets[sym]}%)",
-        }
-        trades.append(trade)
-        _append_csv(TRADES_PATH, TRADE_FIELDS, trade)
+            "Reason": f"{action} toward Tier {tier} ({label})",
+        })
 
     portfolio["cash"] = round(cash, 2)
 
-    # Recompute total after sells for buy sizing
+    # Recompute after sells
     total = portfolio_value(portfolio, quotes)
     max_step = total * max_step_pct / 100
     cash = float(portfolio.get("cash") or 0)
 
     # 2) Buys (underweight assets)
+    # Cash available for investment = cash minus the amount we want to keep parked
+    cash_to_keep = total * cash_target_pct / 100
+    deployable_cash = max(0.0, cash - cash_to_keep)
+
     for sym in ASSETS:
         price = quotes[sym]["price"]
-        if price <= 0 or cash < 1:
+        if price <= 0 or deployable_cash < 1:
             continue
         h = holdings[sym]
         shares = float(h.get("shares") or 0)
         current_val = shares * price
-        target_val = total * targets[sym] / 100
+        target_val = total * effective_targets[sym] / 100
         diff = target_val - current_val
         if diff <= 0.01:
             continue
-        buy_val = min(diff, max_step, cash)
+        buy_val = min(diff, max_step, deployable_cash)
         if buy_val < 1:
             continue
         buy_shares = round(buy_val / price, 4)
         notional = round(buy_shares * price, 2)
-        if notional > cash:
-            buy_shares = round(cash / price, 4)
+        if notional > deployable_cash:
+            buy_shares = round(deployable_cash / price, 4)
             notional = round(buy_shares * price, 2)
         if buy_shares <= 0:
             continue
@@ -245,7 +270,9 @@ def execute_rebalance(
         h["avg_cost"] = round((old_cost + notional) / new_shares, 2) if new_shares else 0
         h["shares"] = round(new_shares, 4)
         cash -= notional
-        trade = {
+        deployable_cash -= notional
+        label = f"{targets.get(sym, 0)}%" + (f" [CASH target: {cash_target_pct:.0f}%]" if cash_target_pct else "")
+        trades.append({
             "Timestamp": stamp,
             "Date": today,
             "Session": session,
@@ -254,59 +281,52 @@ def execute_rebalance(
             "Shares": buy_shares,
             "Price": price,
             "Notional": notional,
-            "Reason": f"{action} toward Tier {tier} ({targets[sym]}%)",
-        }
-        trades.append(trade)
-        _append_csv(TRADES_PATH, TRADE_FIELDS, trade)
+            "Reason": f"{action} toward Tier {tier} ({label})",
+        })
 
     portfolio["cash"] = round(cash, 2)
     portfolio["last_synced"] = stamp
-    save_portfolio(portfolio)
 
-    # Equity snapshot
-    total = portfolio_value(portfolio, quotes)
-    weights = portfolio_weights(portfolio, quotes)
-    starting = float(portfolio.get("starting_capital") or load_config().get("starting_capital", 100_000))
-    ret = round((total / starting - 1) * 100, 2) if starting else 0
-    _append_csv(
-        EQUITY_PATH,
-        EQUITY_FIELDS,
-        {
-            "Date": today,
-            "Session": session,
-            "Total_Value": total,
-            "Cash": portfolio["cash"],
-            "QQQ_pct": weights["QQQ"],
-            "USO_pct": weights["USO"],
-            "GLD_pct": weights["GLD"],
-            "Return_pct": ret,
-            "Tier": tier,
-        },
-    )
+    # Write portfolio + trades + equity snapshot in a single transaction
+    conn = _db.get_conn()
+    with conn:
+        _db.save_portfolio(portfolio, TAB_ID, conn)
+        _db.insert_trades_batch(trades, TAB_ID, conn)
+
+        total_after = portfolio_value(portfolio, quotes)
+        weights = portfolio_weights(portfolio, quotes)
+        starting = float(portfolio.get("starting_capital") or
+                         cfg.get("starting_capital", 100_000))
+        ret = round((total_after / starting - 1) * 100, 2) if starting else 0
+        conn.execute("""
+            INSERT INTO equity_snapshots
+                (tab_id, date, session, total_value, cash,
+                 qqq_pct, uso_pct, gld_pct, return_pct, tier)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (TAB_ID, today, session,
+              total_after, portfolio["cash"],
+              weights["QQQ"], weights["USO"], weights["GLD"],
+              ret, tier))
+
     return portfolio, trades
 
 
+# ---------------------------------------------------------------------------
+# Read helpers (used by server.js via JSON API, not directly)
+# ---------------------------------------------------------------------------
+
 def load_trades(limit: int = 50) -> list[dict]:
-    if not TRADES_PATH.exists():
-        return []
-    with TRADES_PATH.open(newline="") as f:
-        rows = list(csv.DictReader(f))
-    return list(reversed(rows[-limit:]))
+    return _db.load_trades(TAB_ID, limit)
 
 
 def load_equity(limit: int = 60) -> list[dict]:
-    if not EQUITY_PATH.exists():
-        return []
-    with EQUITY_PATH.open(newline="") as f:
-        rows = list(csv.DictReader(f))
-    return rows[-limit:]
+    return _db.load_equity_snapshots(TAB_ID, limit)
 
 
 def paper_summary(portfolio: dict, quotes: dict[str, dict]) -> dict:
     total = portfolio_value(portfolio, quotes)
-    starting = float(
-        portfolio.get("starting_capital") or load_config().get("starting_capital", 100_000)
-    )
+    starting = float(portfolio.get("starting_capital") or
+                     load_config().get("starting_capital", 100_000))
     ret = round((total / starting - 1) * 100, 2) if starting else 0
     ret_dollar = round(total - starting, 2)
     return {
@@ -316,9 +336,13 @@ def paper_summary(portfolio: dict, quotes: dict[str, dict]) -> dict:
         "total_value": total,
         "return_pct": ret,
         "return_dollar": ret_dollar,
-        "trade_count": len(load_trades(9999)),
+        "trade_count": _db.count_trades(TAB_ID),
     }
 
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
@@ -326,7 +350,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Paper trading utilities")
     parser.add_argument("--init", action="store_true", help="Reset paper portfolio")
     parser.add_argument("--capital", type=float, default=100_000)
-    parser.add_argument("--start-date", type=str, default=None, help="Official start date YYYY-MM-DD")
+    parser.add_argument("--start-date", type=str, default=None,
+                        help="Official start date YYYY-MM-DD")
     args = parser.parse_args()
     if args.init:
         p = init_paper(args.capital, started_at=args.start_date)

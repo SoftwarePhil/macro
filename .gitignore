@@ -15,11 +15,16 @@ data/xai_api_key.txt
 # Local runtime output
 logs/
 
-# Local portfolio and paper-trading state
+# Local portfolio and paper-trading state (now stored in SQLite)
 data/paper_*.json
 data/paper_*.csv
 data/portfolio.json
 data/live_quotes.json
+
+# SQLite database and WAL journal files (runtime state, not source)
+data/regime.db
+data/regime.db-shm
+data/regime.db-wal
 
 # Parent-level generated strategy log used by jobs
 ../strategy_log.csv

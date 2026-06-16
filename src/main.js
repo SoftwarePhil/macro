@@ -2,7 +2,7 @@ import "./style.css";
 import { mountPortfolioChart, fmtChartMoney } from "./portfolioChart.js";
 
 const ASSETS = ["QQQ", "USO", "GLD"];
-const COLORS = { QQQ: "#6ee7b7", USO: "#fbbf24", GLD: "#f59e0b" };
+const COLORS = { QQQ: "#6ee7b7", USO: "#fbbf24", GLD: "#f59e0b", CASH: "#94a3b8" };
 
 let state = { data: null, loading: true, error: null, modalOpen: false, llmReportOpen: false, chartRange: "ALL", activeTab: "paper" };
 let chartResizeTimer = null;
@@ -64,16 +64,18 @@ function allocationRows(drift, positions) {
   const posMap = Object.fromEntries(positions.map((p) => [p.symbol, p]));
   return drift
     .map((d) => {
-      const pos = posMap[d.symbol];
-      const color = COLORS[d.symbol];
+      const isCash = d.symbol === "CASH";
+      const color = COLORS[d.symbol] || "#94a3b8";
       const warn = d.absDrift > 5 ? `<div class="drift-warn">Drift ${fmtPct(d.drift, true)}</div>` : "";
+      // Clamp target marker to [0%, 100%] so 0% doesn't render at -1px
+      const targetLeft = Math.max(0, Math.min(100, d.target));
       return `
         <div class="allocation-row">
           <div class="sym ${d.symbol.toLowerCase()}">${d.symbol}</div>
           <div>
             <div class="bar-track">
-              <div class="bar-actual" style="width:${Math.min(d.actual, 100)}%;background:${color}"></div>
-              <div class="bar-target" style="left:calc(${d.target}% - 1px)"></div>
+              <div class="bar-actual" style="width:${Math.min(d.actual, 100)}%;background:${color};${isCash ? "opacity:0.5" : ""}"></div>
+              ${d.target > 0 ? `<div class="bar-target" style="left:calc(${targetLeft}% - 1px)"></div>` : ""}
             </div>
             ${warn}
           </div>
@@ -191,8 +193,7 @@ function positionsTable(positions) {
 }
 
 function editModal() {
-  const p = state.data?.portfolio;
-  if (!state.modalOpen || !p) return "";
+  if (!state.modalOpen) return "";
   const rows = ASSETS.map((sym) => {
     const h = state.editHoldings?.[sym] ?? { shares: 0, avg_cost: 0 };
     return `
@@ -303,22 +304,23 @@ function tradesTable(trades) {
 
 function renderMain() {
   const d = state.data;
-  const { regime, portfolio, drift, market, paper } = d;
+  const { regime, market } = d;
+  const tabList = Array.isArray(d.tabs || d.paper?.tabs) ? (d.tabs || d.paper.tabs) : [];
+  const currentTab = tabList.find(t => t.id === state.activeTab) || tabList[0] || {id: 'paper', real_trading_enabled: false, type: 'paper'};
+  const thisTabData = d.tabData && d.tabData[currentTab.id] ? d.tabData[currentTab.id] : {};
+  const drift = thisTabData.drift || { vsRecommended: [], vsTier: [], maxDrift: 0, rebalanceNeeded: false };
+  const portfolio = thisTabData.portfolio || { positions: [], totalValue: 0, invested: 0, cash: 0, weights: {} };
+  const isRealTypeTab = currentTab.type === 'robinhood' || currentTab.id === 'real';
+  const showEmptyReal = isRealTypeTab && !currentTab.real_trading_enabled;
   const action = drift.rebalanceNeeded
     ? `<div class="alert">Rebalance suggested — max drift ${fmtPct(drift.maxDrift)} exceeds 5% threshold. Cap moves at 5–10% per day.</div>`
     : `<div class="alert ok">Within drift tolerance — Hold current allocation.</div>`;
-
-  const tabList = Array.isArray(d.tabs || d.paper?.tabs) ? (d.tabs || d.paper.tabs) : [];
-  const currentTab = tabList.find(t => t.id === state.activeTab) || tabList[0] || {id: 'paper', real_trading_enabled: false, type: 'paper'};
-  const isRealTypeTab = currentTab.type === 'robinhood' || currentTab.id === 'real';
-  const showEmptyReal = isRealTypeTab && !currentTab.real_trading_enabled;
-  const thisTabData = d.tabData && d.tabData[currentTab.id] ? d.tabData[currentTab.id] : {};
 
   return `
     <header class="top">
       <div>
         <h1>3-Tier Regime Dashboard</h1>
-        <p>${regime.logDate ? `Last update: ${regime.logDate} ${regime.session || ""}` : "Awaiting first regime log"} · ${(thisTabData.portfolio ? thisTabData.portfolio.accountName : portfolio.accountName) || 'Account'}</p>
+        <p>${regime.logDate ? `Last update: ${regime.logDate} ${regime.session || ""}` : "Awaiting first regime log"} · ${thisTabData.portfolio?.accountName || 'Account'}</p>
         <p style="margin-top:4px;font-size:0.8rem">Jobs: 9:30 AM open · 4:00 PM close (ET, weekdays)</p>
       </div>
       <div class="header-actions">
@@ -373,7 +375,7 @@ function renderMain() {
       <div class="card">
         <h2>Today's Regime</h2>
         <div class="stat-value" style="font-size:1.2rem">${thisTabData.regime ? thisTabData.regime.name : 'Default'}</div>
-        <div class="stat-sub">QQQ ${thisTabData.regime ? thisTabData.regime.recommended.QQQ : 40}% · USO ${thisTabData.regime ? thisTabData.regime.recommended.USO : 30}% · GLD ${thisTabData.regime ? thisTabData.regime.recommended.GLD : 30}%</div>
+        <div class="stat-sub">QQQ ${thisTabData.regime ? thisTabData.regime.recommended.QQQ : 40}% · USO ${thisTabData.regime ? thisTabData.regime.recommended.USO : 30}% · GLD ${thisTabData.regime ? thisTabData.regime.recommended.GLD : 30}%${(thisTabData.regime?.recommended?.CASH ?? 0) > 0 ? ` · CASH ${thisTabData.regime.recommended.CASH}%` : ""}</div>
         <div class="stat-sub" style="margin-top:8px"><strong>${thisTabData.regime ? thisTabData.regime.suggestedAction || "Hold" : "Hold"}</strong>${thisTabData.regime && thisTabData.regime.rebalanceNote ? ` — ${thisTabData.regime.rebalanceNote}` : ""}</div>
       </div>
       <div class="card">
@@ -452,7 +454,7 @@ function renderMain() {
       <div class="tier-list">${tierList(d.tiers, regime.tier)}</div>
     </div>` : ""}
 
-    <div class="footer-meta mono">Updated ${new Date(d.generatedAt).toLocaleString()} · Source: ${(thisTabData.portfolio ? thisTabData.portfolio.source : portfolio.source) || 'paper'}${thisTabData.enabled ? ` · Started ${thisTabData.startedAt || ''} · ${thisTabData.tradeCount || 0} trades` : ""}${(thisTabData.portfolio && thisTabData.portfolio.lastSynced) ? ` · Synced ${new Date(thisTabData.portfolio.lastSynced).toLocaleString()}` : ""}</div>
+    <div class="footer-meta mono">Updated ${new Date(d.generatedAt).toLocaleString()} · Source: ${thisTabData.portfolio?.source || 'paper'}${thisTabData.enabled ? ` · Started ${thisTabData.startedAt || ''} · ${thisTabData.tradeCount || 0} trades` : ""}${(thisTabData.portfolio && thisTabData.portfolio.lastSynced) ? ` · Synced ${new Date(thisTabData.portfolio.lastSynced).toLocaleString()}` : ""}</div>
   `;
 }
 
@@ -497,7 +499,11 @@ function mountChart() {
 }
 
 function openEditModal() {
-  const p = state.data.portfolio;
+  const d = state.data;
+  const tabList = Array.isArray(d?.tabs) ? d.tabs : [];
+  const currentTab = tabList.find(t => t.id === state.activeTab) || tabList[0] || { id: 'paper' };
+  const thisTabData = d?.tabData?.[currentTab.id] || {};
+  const p = thisTabData.portfolio || { cash: 0, positions: [] };
   state.editCash = p.cash;
   state.editHoldings = Object.fromEntries(
     p.positions.map((pos) => [pos.symbol, { shares: pos.shares, avg_cost: pos.avg_cost }]),

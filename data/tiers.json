@@ -2,16 +2,34 @@
   "1": {
     "name": "Risk-On / Growth",
     "description": "Strong economy, low inflation fears, stable geopolitics",
-    "targets": { "QQQ": 60, "USO": 25, "GLD": 15 }
+    "targets": { "QQQ": 60, "USO": 25, "GLD": 15, "CASH": 0 },
+    "ranges": {
+      "QQQ":  { "min": 50, "max": 70 },
+      "USO":  { "min":  0, "max": 30 },
+      "GLD":  { "min":  5, "max": 25 },
+      "CASH": { "min":  0, "max": 20 }
+    }
   },
   "2": {
     "name": "Balanced / Neutral",
     "description": "Mixed data, moderate volatility, contained geopolitics",
-    "targets": { "QQQ": 40, "USO": 30, "GLD": 30 }
+    "targets": { "QQQ": 40, "USO": 25, "GLD": 25, "CASH": 10 },
+    "ranges": {
+      "QQQ":  { "min": 25, "max": 50 },
+      "USO":  { "min":  0, "max": 35 },
+      "GLD":  { "min": 15, "max": 40 },
+      "CASH": { "min":  0, "max": 25 }
+    }
   },
   "3": {
     "name": "Risk-Off / Stagflation",
-    "description": "High uncertainty, rising gold/oil, falling equities",
-    "targets": { "QQQ": 20, "USO": 20, "GLD": 60 }
+    "description": "High uncertainty, rising gold/oil, falling equities, geopolitics escalation",
+    "targets": { "QQQ": 15, "USO": 10, "GLD": 55, "CASH": 20 },
+    "ranges": {
+      "QQQ":  { "min":  0, "max": 25 },
+      "USO":  { "min":  0, "max": 20 },
+      "GLD":  { "min": 40, "max": 70 },
+      "CASH": { "min": 10, "max": 40 }
+    }
   }
 }
