@@ -1,0 +1,24 @@
+.DS_Store
+node_modules/
+dist/
+
+# Secrets and local env (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# Local runtime output
+logs/
+
+# Local portfolio and paper-trading state
+data/paper_*.json
+data/paper_*.csv
+data/portfolio.json
+data/live_quotes.json
+
+# Parent-level generated strategy log used by jobs
+../strategy_log.csv

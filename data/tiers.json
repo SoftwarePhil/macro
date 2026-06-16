@@ -1,0 +1,17 @@
+{
+  "1": {
+    "name": "Risk-On / Growth",
+    "description": "Strong economy, low inflation fears, stable geopolitics",
+    "targets": { "QQQ": 60, "USO": 25, "GLD": 15 }
+  },
+  "2": {
+    "name": "Balanced / Neutral",
+    "description": "Mixed data, moderate volatility, contained geopolitics",
+    "targets": { "QQQ": 40, "USO": 30, "GLD": 30 }
+  },
+  "3": {
+    "name": "Risk-Off / Stagflation",
+    "description": "High uncertainty, rising gold/oil, falling equities",
+    "targets": { "QQQ": 20, "USO": 20, "GLD": 60 }
+  }
+}

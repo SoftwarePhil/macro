@@ -1,0 +1,25 @@
+{
+  "name": "regime-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"node server.js\" \"vite\"",
+    "server": "node server.js",
+    "job:open": "python3 scripts/daily_regime_job.py --session open",
+    "job:close": "python3 scripts/daily_regime_job.py --session close",
+    "schedule:install": "bash scripts/install_schedule.sh",
+    "paper:init": "python3 scripts/paper_trade.py --init",
+    "paper:reset": "bash scripts/reset_for_tomorrow.sh",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "vite": "^6.2.0"
+  }
+}
