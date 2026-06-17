@@ -121,6 +121,27 @@ CREATE TABLE IF NOT EXISTS chart_snapshots (
 );
 CREATE INDEX IF NOT EXISTS chart_tab_ts ON chart_snapshots(tab_id, ts DESC);
 
+CREATE TABLE IF NOT EXISTS job_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT NOT NULL,
+    duration_s      REAL NOT NULL DEFAULT 0,
+    session         TEXT NOT NULL,
+    tab_id          TEXT NOT NULL DEFAULT 'paper',
+    status          TEXT NOT NULL DEFAULT 'ok',
+    tier            INTEGER,
+    strength        REAL,
+    action          TEXT,
+    paper_enabled   INTEGER NOT NULL DEFAULT 0,
+    llm_status      TEXT,
+    trade_count     INTEGER NOT NULL DEFAULT 0,
+    portfolio_value REAL,
+    error_message   TEXT,
+    report_file     TEXT,
+    llm_report_id   INTEGER REFERENCES llm_reports(id)
+);
+CREATE INDEX IF NOT EXISTS job_runs_started ON job_runs(started_at DESC);
+
 CREATE TABLE IF NOT EXISTS llm_reports (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     tab_id      TEXT NOT NULL DEFAULT 'paper',
@@ -128,8 +149,7 @@ CREATE TABLE IF NOT EXISTS llm_reports (
     session     TEXT NOT NULL,
     filename    TEXT,
     report_text TEXT NOT NULL,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    UNIQUE(tab_id, date, session)
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 `;
 
@@ -384,6 +404,49 @@ export function loadChartSnapshots(tabId = "paper") {
     SELECT ts, value, return_pct AS returnPct
     FROM chart_snapshots WHERE tab_id=? ORDER BY ts ASC
   `).all(tabId);
+}
+
+// ---------------------------------------------------------------------------
+// job_runs
+// ---------------------------------------------------------------------------
+
+export function insertJobRun(run) {
+  const stmt = getDb().prepare(`
+    INSERT INTO job_runs
+        (started_at, finished_at, duration_s, session, tab_id,
+         status, tier, strength, action, paper_enabled,
+         llm_status, trade_count, portfolio_value, error_message, report_file)
+    VALUES (@started_at, @finished_at, @duration_s, @session, @tab_id,
+            @status, @tier, @strength, @action, @paper_enabled,
+            @llm_status, @trade_count, @portfolio_value, @error_message, @report_file)
+  `);
+  const result = stmt.run({
+    started_at:      run.started_at,
+    finished_at:     run.finished_at,
+    duration_s:      Number(run.duration_s ?? 0),
+    session:         run.session,
+    tab_id:          run.tab_id ?? "paper",
+    status:          run.status ?? "ok",
+    tier:            run.tier ?? null,
+    strength:        run.strength ?? null,
+    action:          run.action ?? null,
+    paper_enabled:   run.paper_enabled ? 1 : 0,
+    llm_status:      run.llm_status ?? null,
+    trade_count:     Number(run.trade_count ?? 0),
+    portfolio_value: run.portfolio_value ?? null,
+    error_message:   run.error_message ?? null,
+    report_file:     run.report_file ?? null,
+  });
+  return result.lastInsertRowid;
+}
+
+export function loadJobRuns(limit = 100) {
+  return getDb().prepare(`
+    SELECT id, started_at, finished_at, duration_s, session, tab_id,
+           status, tier, strength, action, paper_enabled,
+           llm_status, trade_count, portfolio_value, error_message, report_file
+    FROM job_runs ORDER BY id DESC LIMIT ?
+  `).all(limit);
 }
 
 // ---------------------------------------------------------------------------

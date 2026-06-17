@@ -137,6 +137,27 @@ CREATE TABLE IF NOT EXISTS chart_snapshots (
 );
 CREATE INDEX IF NOT EXISTS chart_tab_ts ON chart_snapshots(tab_id, ts DESC);
 
+CREATE TABLE IF NOT EXISTS job_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at      TEXT NOT NULL,
+    finished_at     TEXT NOT NULL,
+    duration_s      REAL NOT NULL DEFAULT 0,
+    session         TEXT NOT NULL,
+    tab_id          TEXT NOT NULL DEFAULT 'paper',
+    status          TEXT NOT NULL DEFAULT 'ok',   -- 'ok' | 'fail'
+    tier            INTEGER,
+    strength        REAL,
+    action          TEXT,
+    paper_enabled   INTEGER NOT NULL DEFAULT 0,
+    llm_status      TEXT,                          -- 'direct' | 'skipped' | 'error'
+    trade_count     INTEGER NOT NULL DEFAULT 0,
+    portfolio_value REAL,
+    error_message   TEXT,
+    report_file     TEXT,
+    llm_report_id   INTEGER REFERENCES llm_reports(id)
+);
+CREATE INDEX IF NOT EXISTS job_runs_started ON job_runs(started_at DESC);
+
 CREATE TABLE IF NOT EXISTS llm_reports (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     tab_id      TEXT NOT NULL DEFAULT 'paper',
@@ -144,8 +165,7 @@ CREATE TABLE IF NOT EXISTS llm_reports (
     session     TEXT NOT NULL,
     filename    TEXT,
     report_text TEXT NOT NULL,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    UNIQUE(tab_id, date, session)
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 """
 
@@ -548,32 +568,86 @@ def load_chart_snapshots(tab_id: str = "paper",
 
 
 # ---------------------------------------------------------------------------
+# job_runs
+# ---------------------------------------------------------------------------
+
+def insert_job_run(run: dict, conn: sqlite3.Connection | None = None) -> int:
+    """Insert a completed job run record. Returns the new row id."""
+    c = conn or get_conn()
+    cur = c.execute("""
+        INSERT INTO job_runs
+            (started_at, finished_at, duration_s, session, tab_id,
+             status, tier, strength, action, paper_enabled,
+             llm_status, trade_count, portfolio_value, error_message,
+             report_file, llm_report_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        run["started_at"],
+        run["finished_at"],
+        float(run.get("duration_s", 0)),
+        run["session"],
+        run.get("tab_id", "paper"),
+        run.get("status", "ok"),
+        int(run["tier"]) if run.get("tier") is not None else None,
+        float(run["strength"]) if run.get("strength") is not None else None,
+        run.get("action"),
+        1 if run.get("paper_enabled") else 0,
+        run.get("llm_status"),
+        int(run.get("trade_count", 0)),
+        float(run["portfolio_value"]) if run.get("portfolio_value") is not None else None,
+        run.get("error_message"),
+        run.get("report_file"),
+        int(run["llm_report_id"]) if run.get("llm_report_id") is not None else None,
+    ))
+    c.commit()
+    return cur.lastrowid
+
+
+def load_job_runs(limit: int = 100, conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Return job runs newest-first."""
+    c = conn or get_conn()
+    rows = c.execute("""
+        SELECT id, started_at, finished_at, duration_s, session, tab_id,
+               status, tier, strength, action, paper_enabled,
+               llm_status, trade_count, portfolio_value, error_message, report_file
+        FROM job_runs
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
 # llm_reports
 # ---------------------------------------------------------------------------
 
-def upsert_llm_report(tab_id: str, date: str, session: str,
+def insert_llm_report(tab_id: str, date: str, session: str,
                        text: str, filename: str | None = None,
-                       conn: sqlite3.Connection | None = None) -> None:
+                       conn: sqlite3.Connection | None = None) -> int:
+    """Always insert a new LLM report row (one per job run). Returns the new row id."""
     c = conn or get_conn()
-    c.execute("""
+    cur = c.execute("""
         INSERT INTO llm_reports (tab_id, date, session, filename, report_text)
         VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(tab_id, date, session) DO UPDATE SET
-            filename=excluded.filename,
-            report_text=excluded.report_text,
-            created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
     """, (tab_id, date, session.lower(), filename, text))
     c.commit()
+    return cur.lastrowid
 
 
-def load_llm_report(tab_id: str, date: str, session: str,
-                     conn: sqlite3.Connection | None = None) -> dict | None:
+# Keep this alias so any old call sites don't break during transition
+def upsert_llm_report(tab_id: str, date: str, session: str,
+                       text: str, filename: str | None = None,
+                       conn: sqlite3.Connection | None = None) -> int:
+    return insert_llm_report(tab_id, date, session, text, filename, conn)
+
+
+def load_llm_report_by_id(report_id: int,
+                           conn: sqlite3.Connection | None = None) -> dict | None:
     c = conn or get_conn()
     row = c.execute("""
-        SELECT tab_id, date, session, filename, report_text AS text
-        FROM llm_reports
-        WHERE tab_id=? AND date=? AND session=?
-    """, (tab_id, date, session.lower())).fetchone()
+        SELECT id, tab_id, date, session, filename, report_text AS text, created_at
+        FROM llm_reports WHERE id=?
+    """, (report_id,)).fetchone()
     return dict(row) if row else None
 
 

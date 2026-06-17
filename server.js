@@ -19,6 +19,7 @@ import {
   loadChartSnapshots,
   upsertLlmReport,
   loadLatestLlmReport,
+  loadJobRuns,
 } from "./db.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -462,6 +463,7 @@ async function buildDashboardPayload() {
       goldOilRatioSpot: goldSpot && wti ? round(goldSpot / wti) : null,
     },
     tiers,
+    jobRuns: loadJobRuns(50),
   };
 }
 
@@ -491,6 +493,11 @@ app.get("/api/dashboard", async (_req, res) => {
 app.get("/api/log", (req, res) => {
   const tabId = req.query.tab || "paper";
   res.json(loadStrategyLog(tabId).slice().reverse());
+});
+
+app.get("/api/job-runs", (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  res.json(loadJobRuns(limit));
 });
 
 app.get("/api/portfolio", (req, res) => {

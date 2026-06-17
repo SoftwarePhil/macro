@@ -143,6 +143,7 @@ function logTable(rows) {
       <th>QQQ</th>
       <th>USO</th>
       <th>GLD</th>
+      <th>CASH</th>
       <th>Action</th>
     </tr>
   `;
@@ -157,12 +158,80 @@ function logTable(rows) {
         <td class="mono">${r["Recommended_QQQ_%"]}%</td>
         <td class="mono">${r["Recommended_USO_%"]}%</td>
         <td class="mono">${r["Recommended_GLD_%"]}%</td>
+        <td class="mono">${r["Recommended_CASH_%"] ?? 0}%</td>
         <td>${r.Suggested_Action || "Hold"}</td>
       </tr>
     `,
     )
     .join("");
   return `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function jobRunsTable(runs) {
+  if (!runs?.length) return `<p class="stat-sub">No job runs recorded yet — runs after this update will appear here.</p>`;
+
+  const statusBadge = (s) => {
+    if (s === "ok")   return `<span class="badge tier-1" style="font-size:0.65rem;padding:1px 6px">OK</span>`;
+    if (s === "fail") return `<span class="badge tier-3" style="font-size:0.65rem;padding:1px 6px">FAIL</span>`;
+    return `<span class="badge" style="font-size:0.65rem;padding:1px 6px">${s}</span>`;
+  };
+  const llmBadge = (s) => {
+    if (!s) return "—";
+    if (s === "direct")  return `<span style="color:var(--up);font-size:0.7rem">LLM</span>`;
+    if (s === "skipped") return `<span style="color:var(--muted);font-size:0.7rem">quant</span>`;
+    if (s === "error")   return `<span style="color:var(--down);font-size:0.7rem">error</span>`;
+    return s;
+  };
+
+  const body = runs.slice(0, 30).map((r) => {
+    const ts = new Date(r.started_at).toLocaleString("en-US", {
+      month: "short", day: "numeric",
+      hour: "numeric", minute: "2-digit",
+      timeZoneName: "short",
+    });
+    const dur = r.duration_s != null ? `${r.duration_s.toFixed(1)}s` : "—";
+    const val = r.portfolio_value != null ? `$${Math.round(r.portfolio_value).toLocaleString()}` : "—";
+    const tierStr = r.tier != null
+      ? `<span class="badge tier-${r.tier}" style="font-size:0.65rem;padding:1px 6px">T${r.tier}</span>`
+      : "—";
+    const strengthStr = r.strength != null
+      ? `<span class="mono" style="font-size:0.7rem;color:var(--muted)">${(r.strength * 100).toFixed(0)}%</span>`
+      : "";
+    return `
+      <tr>
+        <td class="mono" style="font-size:0.72rem;white-space:nowrap">${ts}</td>
+        <td>${r.session || "—"}</td>
+        <td>${statusBadge(r.status)}${r.error_message ? `<div style="font-size:0.65rem;color:var(--down);margin-top:2px">${escapeHtml(r.error_message)}</div>` : ""}</td>
+        <td>${tierStr} ${strengthStr}</td>
+        <td>${r.action || "—"}</td>
+        <td>${llmBadge(r.llm_status)}</td>
+        <td class="mono">${r.trade_count ?? 0}</td>
+        <td class="mono">${val}</td>
+        <td class="mono" style="color:var(--muted)">${dur}</td>
+      </tr>
+    `;
+  }).join("");
+
+  return `
+    <div class="trades-table">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Session</th>
+            <th>Status</th>
+            <th>Tier</th>
+            <th>Action</th>
+            <th>LLM</th>
+            <th>Trades</th>
+            <th>Value</th>
+            <th>Dur</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
 }
 
 function positionsTable(positions) {
@@ -453,6 +522,12 @@ function renderMain() {
       <h2>Tier Reference</h2>
       <div class="tier-list">${tierList(d.tiers, regime.tier)}</div>
     </div>` : ""}
+
+    <div class="card" style="margin-bottom:16px">
+      <h2>Job Run History</h2>
+      <p class="stat-sub" style="margin-bottom:8px;font-size:0.75rem">Every scheduled and manual job execution — most recent first.</p>
+      ${jobRunsTable(d.jobRuns)}
+    </div>
 
     <div class="footer-meta mono">Updated ${new Date(d.generatedAt).toLocaleString()} · Source: ${thisTabData.portfolio?.source || 'paper'}${thisTabData.enabled ? ` · Started ${thisTabData.startedAt || ''} · ${thisTabData.tradeCount || 0} trades` : ""}${(thisTabData.portfolio && thisTabData.portfolio.lastSynced) ? ` · Synced ${new Date(thisTabData.portfolio.lastSynced).toLocaleString()}` : ""}</div>
   `;

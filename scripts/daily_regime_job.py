@@ -443,21 +443,61 @@ def build_rationale(tier: int, confidence: str, session: str, signals: list[str]
 # ---------------------------------------------------------------------------
 
 def write_report(text: str, today: str, session: str,
-                 tab_id: str = "paper") -> Path:
-    """Write report to DB and also to disk (for backward compat / human reading)."""
+                 tab_id: str = "paper") -> tuple[Path, int]:
+    """Insert LLM report into DB and write to disk. Returns (path, llm_report_id)."""
     filename = f"{today}_{session}.md"
-    _db.upsert_llm_report(tab_id, today, session, text, filename)
+    report_id = _db.insert_llm_report(tab_id, today, session, text, filename)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     path = REPORTS_DIR / filename
     path.write_text(text)
-    return path
+    print(report_id)
+    return path, report_id
 
 
 def log_job(message: str) -> None:
+    """Append a human-readable line to logs/jobs.log (kept for ops visibility)."""
     JOBS_LOG.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(ET_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
     with JOBS_LOG.open("a") as f:
         f.write(f"[{stamp}] {message}\n")
+
+
+def record_job_run(
+    started_at: datetime,
+    session: str,
+    status: str = "ok",
+    tier: int | None = None,
+    strength: float | None = None,
+    action: str | None = None,
+    paper_on: bool = False,
+    llm_status: str | None = None,
+    trade_count: int = 0,
+    portfolio_value: float | None = None,
+    error_message: str | None = None,
+    report_file: str | None = None,
+    llm_report_id: str | None = None
+) -> None:
+    """Write a structured job run record to the job_runs table."""
+    finished = datetime.now(ET_TZ)
+    duration = (finished - started_at).total_seconds()
+    _db.insert_job_run({
+        "started_at":      started_at.isoformat(),
+        "finished_at":     finished.isoformat(),
+        "duration_s":      round(duration, 2),
+        "session":         session,
+        "tab_id":          "paper",
+        "status":          status,
+        "tier":            tier,
+        "strength":        round(strength, 3) if strength is not None else None,
+        "action":          action,
+        "paper_enabled":   paper_on,
+        "llm_status":      llm_status,
+        "trade_count":     trade_count,
+        "portfolio_value": portfolio_value,
+        "error_message":   error_message,
+        "report_file":     report_file,
+        llm_report_id: llm_report_id
+    })
 
 
 def load_agent_prompt() -> str:
@@ -594,7 +634,8 @@ def run(session: str) -> int:
         print(f"Invalid session: {session}", file=sys.stderr)
         return 1
 
-    now = datetime.now(ET_TZ)
+    job_started_at = datetime.now(ET_TZ)
+    now = job_started_at
     today = now.strftime("%Y-%m-%d")
     session_label = session.capitalize()
 
@@ -611,6 +652,8 @@ def run(session: str) -> int:
     quotes = fetch_quotes()
     if not all(sym in quotes for sym in ASSETS):
         log_job(f"FAIL {session_label}: missing core quotes")
+        record_job_run(job_started_at, session_label, status="fail",
+                       error_message="missing core quotes")
         return 1
 
     portfolio = load_portfolio()
@@ -754,14 +797,37 @@ def run(session: str) -> int:
 
     if llm_text.startswith("LLM_CALL_SKIPPED") or llm_text.startswith("LLM_CALL_ERROR"):
         report = quant_report
+        llm_status = "skipped" if llm_text.startswith("LLM_CALL_SKIPPED") else "error"
         log_job(f"LLM fallback for {session_label} (no key or error)")
     else:
         report = llm_text
+        llm_status = "direct"
 
-    report_path = write_report(report, today, session, "paper")
+    # Count trades that happened in this run (trades written since job_started_at)
+    conn = _db.get_conn()
+    run_trade_count = conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE tab_id='paper' AND timestamp >= ?",
+        (job_started_at.isoformat(),)
+    ).fetchone()[0]
+
+    report_path = write_report(report, today, session, "paper")[0]
+    report_id = write_report(report, today, session, "paper")[1]
     paper_tag = " paper=on" if paper_enabled() else ""
-    llm_tag = " llm=direct" if not llm_text.startswith("LLM_") else " llm=skipped"
-    log_job(f"OK {session_label}: tier={tier} action={action}{paper_tag}{llm_tag} report={report_path.name}")
+    llm_tag = f" llm={llm_status}"
+    log_job(f"OK {session_label}: tier={tier} action={action}{paper_tag}{llm_tag} report={report_path}")
+    record_job_run(
+        job_started_at, session_label,
+        status="ok",
+        tier=tier,
+        strength=strength,
+        action=action,
+        paper_on=paper_enabled(),
+        llm_status=llm_status,
+        trade_count=run_trade_count,
+        portfolio_value=total_value,
+        report_file=report_path,
+        llm_report_id=report_id
+    )
     print(report)
 
     print("\nSTRUCTURED_DATA_FOR_PROMPT:")
