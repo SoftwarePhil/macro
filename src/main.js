@@ -4,7 +4,17 @@ import { mountPortfolioChart, fmtChartMoney } from "./portfolioChart.js";
 const ASSETS = ["QQQ", "USO", "GLD"];
 const COLORS = { QQQ: "#6ee7b7", USO: "#fbbf24", GLD: "#f59e0b", CASH: "#94a3b8" };
 
-let state = { data: null, loading: true, error: null, modalOpen: false, llmReportOpen: false, chartRange: "ALL", activeTab: "paper" };
+let state = {
+  data: null,
+  loading: true,
+  error: null,
+  modalOpen: false,
+  llmReportOpen: false,
+  jobReportOpen: false,
+  jobReport: null,
+  chartRange: "ALL",
+  activeTab: "paper",
+};
 let chartResizeTimer = null;
 
 async function fetchDashboard() {
@@ -208,6 +218,7 @@ function jobRunsTable(runs) {
         <td class="mono">${r.trade_count ?? 0}</td>
         <td class="mono">${val}</td>
         <td class="mono" style="color:var(--muted)">${dur}</td>
+        <td>${r.llm_report_id ? `<button type="button" class="small" data-job-report-id="${r.id}">View</button>` : "—"}</td>
       </tr>
     `;
   }).join("");
@@ -226,10 +237,49 @@ function jobRunsTable(runs) {
             <th>Trades</th>
             <th>Value</th>
             <th>Dur</th>
+            <th>Report</th>
           </tr>
         </thead>
         <tbody>${body}</tbody>
       </table>
+    </div>
+  `;
+}
+
+function jobReportModal() {
+  if (!state.jobReportOpen) return "";
+
+  const rep = state.jobReport?.report;
+  const job = state.jobReport?.jobRun;
+  if (!rep || !rep.text) {
+    return `
+      <div class="modal-backdrop" id="job-report-modal-backdrop">
+        <div class="modal">
+          <h2>Job Report</h2>
+          <p class="stat-sub">No report found for this job run.</p>
+          <div class="modal-actions">
+            <button type="button" id="job-report-modal-close">Close</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="modal-backdrop" id="job-report-modal-backdrop">
+      <div class="modal" style="max-width: 900px; width: 95%;">
+        <h2>Job LLM Report</h2>
+        <div style="font-size:0.75rem;color:var(--muted);margin-bottom:8px">
+          Job #${job?.id ?? "?"} · ${job?.session ?? ""} · ${job?.started_at ? new Date(job.started_at).toLocaleString() : ""} · ${rep.filename || "report"}
+        </div>
+        <div class="llm-report-body">
+          <pre>${escapeHtml(rep.text)}</pre>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="job-report-modal-close">Close</button>
+          <button type="button" id="job-report-modal-copy">Copy report text</button>
+        </div>
+      </div>
     </div>
   `;
 }
@@ -544,7 +594,7 @@ function render() {
     document.getElementById("btn-retry")?.addEventListener("click", fetchDashboard);
     return;
   }
-  root.innerHTML = renderMain() + editModal() + llmReportModal();
+  root.innerHTML = renderMain() + editModal() + llmReportModal() + jobReportModal();
   bindEvents();
   mountChart();
 }
@@ -674,6 +724,47 @@ function bindEvents() {
   document.getElementById("llm-modal-backdrop")?.addEventListener("click", (e) => {
     if (e.target.id === "llm-modal-backdrop") {
       state.llmReportOpen = false;
+      render();
+    }
+  });
+
+  // Per-job linked report modal
+  document.querySelectorAll("[data-job-report-id]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.jobReportId;
+      if (!id) return;
+      try {
+        const res = await fetch(`/api/job-runs/${id}/report`);
+        if (!res.ok) throw new Error(await res.text());
+        state.jobReport = await res.json();
+      } catch (err) {
+        state.jobReport = { report: { text: `Failed to load report: ${err.message || err}` }, jobRun: { id } };
+      }
+      state.jobReportOpen = true;
+      render();
+    });
+  });
+
+  document.getElementById("job-report-modal-close")?.addEventListener("click", () => {
+    state.jobReportOpen = false;
+    render();
+  });
+
+  document.getElementById("job-report-modal-copy")?.addEventListener("click", () => {
+    const text = state.jobReport?.report?.text || "";
+    if (!text) return;
+    navigator.clipboard?.writeText(text).then(() => {
+      const btn = document.getElementById("job-report-modal-copy");
+      if (!btn) return;
+      const old = btn.textContent;
+      btn.textContent = "Copied!";
+      setTimeout(() => { btn.textContent = old; }, 1200);
+    }).catch(() => {});
+  });
+
+  document.getElementById("job-report-modal-backdrop")?.addEventListener("click", (e) => {
+    if (e.target.id === "job-report-modal-backdrop") {
+      state.jobReportOpen = false;
       render();
     }
   });

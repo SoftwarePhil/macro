@@ -609,7 +609,7 @@ def load_job_runs(limit: int = 100, conn: sqlite3.Connection | None = None) -> l
     rows = c.execute("""
         SELECT id, started_at, finished_at, duration_s, session, tab_id,
                status, tier, strength, action, paper_enabled,
-               llm_status, trade_count, portfolio_value, error_message, report_file
+               llm_status, trade_count, portfolio_value, error_message, report_file, llm_report_id
         FROM job_runs
         ORDER BY id DESC
         LIMIT ?

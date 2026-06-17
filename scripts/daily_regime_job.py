@@ -475,7 +475,7 @@ def record_job_run(
     portfolio_value: float | None = None,
     error_message: str | None = None,
     report_file: str | None = None,
-    llm_report_id: str | None = None
+    llm_report_id: int | None = None,
 ) -> None:
     """Write a structured job run record to the job_runs table."""
     finished = datetime.now(ET_TZ)
@@ -496,7 +496,7 @@ def record_job_run(
         "portfolio_value": portfolio_value,
         "error_message":   error_message,
         "report_file":     report_file,
-        llm_report_id: llm_report_id
+        "llm_report_id":    llm_report_id,
     })
 
 
@@ -810,11 +810,10 @@ def run(session: str) -> int:
         (job_started_at.isoformat(),)
     ).fetchone()[0]
 
-    report_path = write_report(report, today, session, "paper")[0]
-    report_id = write_report(report, today, session, "paper")[1]
+    report_path, report_id = write_report(report, today, session, "paper")
     paper_tag = " paper=on" if paper_enabled() else ""
     llm_tag = f" llm={llm_status}"
-    log_job(f"OK {session_label}: tier={tier} action={action}{paper_tag}{llm_tag} report={report_path}")
+    log_job(f"OK {session_label}: tier={tier} action={action}{paper_tag}{llm_tag} report={report_path.name}")
     record_job_run(
         job_started_at, session_label,
         status="ok",
@@ -825,7 +824,7 @@ def run(session: str) -> int:
         llm_status=llm_status,
         trade_count=run_trade_count,
         portfolio_value=total_value,
-        report_file=report_path,
+        report_file=report_path.name,
         llm_report_id=report_id
     )
     print(report)
@@ -862,7 +861,7 @@ def run(session: str) -> int:
             }
             real_llm = call_xai_for_report("real", session_label, real_struct, previous, headlines, agent_prompt)
             if not real_llm.startswith("LLM_"):
-                real_report_path = write_report(real_llm, today, f"{session}_real", "real")
+                real_report_path, _ = write_report(real_llm, today, f"{session}_real", "real")
                 log_job(f"OK {session_label}: real tab LLM report written ({real_report_path.name})")
             else:
                 real_fallback = (

@@ -415,10 +415,10 @@ export function insertJobRun(run) {
     INSERT INTO job_runs
         (started_at, finished_at, duration_s, session, tab_id,
          status, tier, strength, action, paper_enabled,
-         llm_status, trade_count, portfolio_value, error_message, report_file)
+         llm_status, trade_count, portfolio_value, error_message, report_file, llm_report_id)
     VALUES (@started_at, @finished_at, @duration_s, @session, @tab_id,
             @status, @tier, @strength, @action, @paper_enabled,
-            @llm_status, @trade_count, @portfolio_value, @error_message, @report_file)
+            @llm_status, @trade_count, @portfolio_value, @error_message, @report_file, @llm_report_id)
   `);
   const result = stmt.run({
     started_at:      run.started_at,
@@ -436,6 +436,7 @@ export function insertJobRun(run) {
     portfolio_value: run.portfolio_value ?? null,
     error_message:   run.error_message ?? null,
     report_file:     run.report_file ?? null,
+    llm_report_id:   run.llm_report_id ?? null,
   });
   return result.lastInsertRowid;
 }
@@ -444,7 +445,7 @@ export function loadJobRuns(limit = 100) {
   return getDb().prepare(`
     SELECT id, started_at, finished_at, duration_s, session, tab_id,
            status, tier, strength, action, paper_enabled,
-           llm_status, trade_count, portfolio_value, error_message, report_file
+           llm_status, trade_count, portfolio_value, error_message, report_file, llm_report_id
     FROM job_runs ORDER BY id DESC LIMIT ?
   `).all(limit);
 }
@@ -453,15 +454,33 @@ export function loadJobRuns(limit = 100) {
 // llm_reports
 // ---------------------------------------------------------------------------
 
-export function upsertLlmReport(tabId, date, session, text, filename = null) {
-  getDb().prepare(`
+export function insertLlmReport(tabId, date, session, text, filename = null) {
+  const result = getDb().prepare(`
     INSERT INTO llm_reports (tab_id, date, session, filename, report_text)
     VALUES (@tab_id, @date, @session, @filename, @text)
-    ON CONFLICT(tab_id, date, session) DO UPDATE SET
-        filename=excluded.filename,
-        report_text=excluded.report_text,
-        created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
   `).run({ tab_id: tabId, date, session: session.toLowerCase(), filename, text });
+  return result.lastInsertRowid;
+}
+
+// Backward-compatible alias
+export const upsertLlmReport = insertLlmReport;
+
+export function loadLlmReportById(reportId) {
+  const row = getDb().prepare(`
+    SELECT id, tab_id, date, session, filename, report_text AS text, created_at
+    FROM llm_reports WHERE id=?
+  `).get(reportId);
+  return row || null;
+}
+
+export function loadJobRunById(jobRunId) {
+  const row = getDb().prepare(`
+    SELECT id, started_at, finished_at, duration_s, session, tab_id,
+           status, tier, strength, action, paper_enabled,
+           llm_status, trade_count, portfolio_value, error_message, report_file, llm_report_id
+    FROM job_runs WHERE id=?
+  `).get(jobRunId);
+  return row || null;
 }
 
 export function loadLatestLlmReport(tabId) {
