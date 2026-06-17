@@ -19,6 +19,9 @@ import {
   loadChartSnapshots,
   upsertLlmReport,
   loadLatestLlmReport,
+  loadJobRuns,
+  loadJobRunById,
+  loadLlmReportById,
 } from "./db.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -462,6 +465,7 @@ async function buildDashboardPayload() {
       goldOilRatioSpot: goldSpot && wti ? round(goldSpot / wti) : null,
     },
     tiers,
+    jobRuns: loadJobRuns(50),
   };
 }
 
@@ -491,6 +495,28 @@ app.get("/api/dashboard", async (_req, res) => {
 app.get("/api/log", (req, res) => {
   const tabId = req.query.tab || "paper";
   res.json(loadStrategyLog(tabId).slice().reverse());
+});
+
+app.get("/api/job-runs", (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  res.json(loadJobRuns(limit));
+});
+
+app.get("/api/job-runs/:id/report", (req, res) => {
+  const jobId = Number(req.params.id);
+  if (!Number.isFinite(jobId) || jobId <= 0) {
+    return res.status(400).json({ error: "invalid job id" });
+  }
+  const job = loadJobRunById(jobId);
+  if (!job) return res.status(404).json({ error: "job run not found" });
+  if (!job.llm_report_id) {
+    return res.status(404).json({ error: "no LLM report linked to this job run" });
+  }
+  const report = loadLlmReportById(job.llm_report_id);
+  if (!report) {
+    return res.status(404).json({ error: "linked LLM report not found" });
+  }
+  res.json({ jobRun: job, report });
 });
 
 app.get("/api/portfolio", (req, res) => {

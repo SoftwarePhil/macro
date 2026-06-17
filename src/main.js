@@ -4,7 +4,17 @@ import { mountPortfolioChart, fmtChartMoney } from "./portfolioChart.js";
 const ASSETS = ["QQQ", "USO", "GLD"];
 const COLORS = { QQQ: "#6ee7b7", USO: "#fbbf24", GLD: "#f59e0b", CASH: "#94a3b8" };
 
-let state = { data: null, loading: true, error: null, modalOpen: false, llmReportOpen: false, chartRange: "ALL", activeTab: "paper" };
+let state = {
+  data: null,
+  loading: true,
+  error: null,
+  modalOpen: false,
+  llmReportOpen: false,
+  jobReportOpen: false,
+  jobReport: null,
+  chartRange: "ALL",
+  activeTab: "paper",
+};
 let chartResizeTimer = null;
 
 async function fetchDashboard() {
@@ -143,6 +153,7 @@ function logTable(rows) {
       <th>QQQ</th>
       <th>USO</th>
       <th>GLD</th>
+      <th>CASH</th>
       <th>Action</th>
     </tr>
   `;
@@ -157,12 +168,120 @@ function logTable(rows) {
         <td class="mono">${r["Recommended_QQQ_%"]}%</td>
         <td class="mono">${r["Recommended_USO_%"]}%</td>
         <td class="mono">${r["Recommended_GLD_%"]}%</td>
+        <td class="mono">${r["Recommended_CASH_%"] ?? 0}%</td>
         <td>${r.Suggested_Action || "Hold"}</td>
       </tr>
     `,
     )
     .join("");
   return `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+}
+
+function jobRunsTable(runs) {
+  if (!runs?.length) return `<p class="stat-sub">No job runs recorded yet — runs after this update will appear here.</p>`;
+
+  const statusBadge = (s) => {
+    if (s === "ok")   return `<span class="badge tier-1" style="font-size:0.65rem;padding:1px 6px">OK</span>`;
+    if (s === "fail") return `<span class="badge tier-3" style="font-size:0.65rem;padding:1px 6px">FAIL</span>`;
+    return `<span class="badge" style="font-size:0.65rem;padding:1px 6px">${s}</span>`;
+  };
+  const llmBadge = (s) => {
+    if (!s) return "—";
+    if (s === "direct")  return `<span style="color:var(--up);font-size:0.7rem">LLM</span>`;
+    if (s === "skipped") return `<span style="color:var(--muted);font-size:0.7rem">quant</span>`;
+    if (s === "error")   return `<span style="color:var(--down);font-size:0.7rem">error</span>`;
+    return s;
+  };
+
+  const body = runs.slice(0, 30).map((r) => {
+    const ts = new Date(r.started_at).toLocaleString("en-US", {
+      month: "short", day: "numeric",
+      hour: "numeric", minute: "2-digit",
+      timeZoneName: "short",
+    });
+    const dur = r.duration_s != null ? `${r.duration_s.toFixed(1)}s` : "—";
+    const val = r.portfolio_value != null ? `$${Math.round(r.portfolio_value).toLocaleString()}` : "—";
+    const tierStr = r.tier != null
+      ? `<span class="badge tier-${r.tier}" style="font-size:0.65rem;padding:1px 6px">T${r.tier}</span>`
+      : "—";
+    const strengthStr = r.strength != null
+      ? `<span class="mono" style="font-size:0.7rem;color:var(--muted)">${(r.strength * 100).toFixed(0)}%</span>`
+      : "";
+    return `
+      <tr>
+        <td class="mono" style="font-size:0.72rem;white-space:nowrap">${ts}</td>
+        <td>${r.session || "—"}</td>
+        <td>${statusBadge(r.status)}${r.error_message ? `<div style="font-size:0.65rem;color:var(--down);margin-top:2px">${escapeHtml(r.error_message)}</div>` : ""}</td>
+        <td>${tierStr} ${strengthStr}</td>
+        <td>${r.action || "—"}</td>
+        <td>${llmBadge(r.llm_status)}</td>
+        <td class="mono">${r.trade_count ?? 0}</td>
+        <td class="mono">${val}</td>
+        <td class="mono" style="color:var(--muted)">${dur}</td>
+        <td>${r.llm_report_id ? `<button type="button" class="small" data-job-report-id="${r.id}">View</button>` : "—"}</td>
+      </tr>
+    `;
+  }).join("");
+
+  return `
+    <div class="trades-table">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Session</th>
+            <th>Status</th>
+            <th>Tier</th>
+            <th>Action</th>
+            <th>LLM</th>
+            <th>Trades</th>
+            <th>Value</th>
+            <th>Dur</th>
+            <th>Report</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function jobReportModal() {
+  if (!state.jobReportOpen) return "";
+
+  const rep = state.jobReport?.report;
+  const job = state.jobReport?.jobRun;
+  if (!rep || !rep.text) {
+    return `
+      <div class="modal-backdrop" id="job-report-modal-backdrop">
+        <div class="modal">
+          <h2>Job Report</h2>
+          <p class="stat-sub">No report found for this job run.</p>
+          <div class="modal-actions">
+            <button type="button" id="job-report-modal-close">Close</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="modal-backdrop" id="job-report-modal-backdrop">
+      <div class="modal" style="max-width: 900px; width: 95%;">
+        <h2>Job LLM Report</h2>
+        <div style="font-size:0.75rem;color:var(--muted);margin-bottom:8px">
+          Job #${job?.id ?? "?"} · ${job?.session ?? ""} · ${job?.started_at ? new Date(job.started_at).toLocaleString() : ""} · ${rep.filename || "report"}
+        </div>
+        <div class="llm-report-body">
+          <pre>${escapeHtml(rep.text)}</pre>
+        </div>
+        <div class="modal-actions">
+          <button type="button" id="job-report-modal-close">Close</button>
+          <button type="button" id="job-report-modal-copy">Copy report text</button>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function positionsTable(positions) {
@@ -454,6 +573,12 @@ function renderMain() {
       <div class="tier-list">${tierList(d.tiers, regime.tier)}</div>
     </div>` : ""}
 
+    <div class="card" style="margin-bottom:16px">
+      <h2>Job Run History</h2>
+      <p class="stat-sub" style="margin-bottom:8px;font-size:0.75rem">Every scheduled and manual job execution — most recent first.</p>
+      ${jobRunsTable(d.jobRuns)}
+    </div>
+
     <div class="footer-meta mono">Updated ${new Date(d.generatedAt).toLocaleString()} · Source: ${thisTabData.portfolio?.source || 'paper'}${thisTabData.enabled ? ` · Started ${thisTabData.startedAt || ''} · ${thisTabData.tradeCount || 0} trades` : ""}${(thisTabData.portfolio && thisTabData.portfolio.lastSynced) ? ` · Synced ${new Date(thisTabData.portfolio.lastSynced).toLocaleString()}` : ""}</div>
   `;
 }
@@ -469,7 +594,7 @@ function render() {
     document.getElementById("btn-retry")?.addEventListener("click", fetchDashboard);
     return;
   }
-  root.innerHTML = renderMain() + editModal() + llmReportModal();
+  root.innerHTML = renderMain() + editModal() + llmReportModal() + jobReportModal();
   bindEvents();
   mountChart();
 }
@@ -599,6 +724,47 @@ function bindEvents() {
   document.getElementById("llm-modal-backdrop")?.addEventListener("click", (e) => {
     if (e.target.id === "llm-modal-backdrop") {
       state.llmReportOpen = false;
+      render();
+    }
+  });
+
+  // Per-job linked report modal
+  document.querySelectorAll("[data-job-report-id]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.jobReportId;
+      if (!id) return;
+      try {
+        const res = await fetch(`/api/job-runs/${id}/report`);
+        if (!res.ok) throw new Error(await res.text());
+        state.jobReport = await res.json();
+      } catch (err) {
+        state.jobReport = { report: { text: `Failed to load report: ${err.message || err}` }, jobRun: { id } };
+      }
+      state.jobReportOpen = true;
+      render();
+    });
+  });
+
+  document.getElementById("job-report-modal-close")?.addEventListener("click", () => {
+    state.jobReportOpen = false;
+    render();
+  });
+
+  document.getElementById("job-report-modal-copy")?.addEventListener("click", () => {
+    const text = state.jobReport?.report?.text || "";
+    if (!text) return;
+    navigator.clipboard?.writeText(text).then(() => {
+      const btn = document.getElementById("job-report-modal-copy");
+      if (!btn) return;
+      const old = btn.textContent;
+      btn.textContent = "Copied!";
+      setTimeout(() => { btn.textContent = old; }, 1200);
+    }).catch(() => {});
+  });
+
+  document.getElementById("job-report-modal-backdrop")?.addEventListener("click", (e) => {
+    if (e.target.id === "job-report-modal-backdrop") {
+      state.jobReportOpen = false;
       render();
     }
   });
