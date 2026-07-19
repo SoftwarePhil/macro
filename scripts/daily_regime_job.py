@@ -25,6 +25,13 @@ from paper_trade import (  # noqa: E402
     portfolio_value as paper_portfolio_value,
     portfolio_weights as paper_portfolio_weights,
 )
+from real_trade import (  # noqa: E402
+    is_real_trading_enabled,
+    load_real_config,
+    queue_rebalance_intents,
+    format_pending_for_confirm,
+)
+import real_trade as _real  # noqa: E402
 
 PORTFOLIO_PATH = ROOT / "data" / "portfolio.json"
 TIERS_PATH = ROOT / "data" / "tiers.json"
@@ -668,6 +675,7 @@ def run(session: str) -> int:
     action, rebalance_note = suggest_action(session_label, weights, targets, previous, tier)
 
     trade_summary = ""
+    real_intent_summary = ""
     if paper_enabled() and action in ("Initialize", "Rebalance"):
         portfolio, trades = execute_rebalance(
             portfolio, quotes, targets, session_label, tier, action
@@ -680,6 +688,29 @@ def run(session: str) -> int:
             trade_summary = "Paper: no trades (cash/limits)"
         total_value = paper_portfolio_value(portfolio, quotes)
         weights = paper_portfolio_weights(portfolio, quotes)
+
+    # Real tab: queue MCP intents only — never auto-place
+    if is_real_trading_enabled() and action in ("Initialize", "Rebalance"):
+        try:
+            real_port = _db.load_portfolio("real")
+            real_cfg = load_real_config()
+            intents = queue_rebalance_intents(
+                real_port, quotes, targets, session_label, tier, action,
+                account_number=real_cfg.get("account_number"),
+            )
+            if intents:
+                parts = [
+                    f"{t['side']} {t['symbol']} ${float(t['notional']):,.0f}"
+                    for t in intents
+                ]
+                real_intent_summary = "Real pending (confirm via MCP): " + ", ".join(parts)
+                log_job(f"REAL INTENTS queued: {len(intents)}")
+                log_job(format_pending_for_confirm(intents).replace("\n", " | "))
+            else:
+                real_intent_summary = "Real: no pending intents (already aligned / limits)"
+        except Exception as exc:  # noqa: BLE001
+            real_intent_summary = f"Real intent error: {exc}"
+            log_job(f"real intents failed: {exc}")
 
     gld = quotes["GLD"]["price"]
     uso = quotes["USO"]["price"]
@@ -718,6 +749,7 @@ def run(session: str) -> int:
         )
 
     paper_line = f"- Paper trades: {trade_summary}\n" if trade_summary else ""
+    real_line = f"- Real intents: {real_intent_summary}\n" if real_intent_summary else ""
     quant_report = f"""# Daily 3-Tier Regime Report — {today} ({session_label})
 
 ## Regime
@@ -736,7 +768,7 @@ def run(session: str) -> int:
 ## Portfolio
 - Value: ${total_value:,.0f}
 - Weights: QQQ {weights['QQQ']}% · USO {weights['USO']}% · GLD {weights['GLD']}%
-{paper_line}{prev_line}
+{paper_line}{real_line}{prev_line}
 
 ## Market
 - QQQ ${quotes['QQQ']['price']} ({quotes['QQQ']['change_pct']:+.2f}%)
@@ -832,16 +864,43 @@ def run(session: str) -> int:
     print("\nSTRUCTURED_DATA_FOR_PROMPT:")
     print(json.dumps(llm_structured, indent=2))
 
-    # Generate report for "real" tab
+    # Generate report + strategy log for "real" tab
     try:
         real_tab = next((t for t in tab_list if t.get("tab_id") == "real"), None)
-        if real_tab:
-            real_p = ROOT / "data" / "real_portfolio.json"
-            real_port = {"cash": 0, "holdings": []}
-            if real_p.exists():
-                real_port = json.loads(real_p.read_text())
+        if real_tab or is_real_trading_enabled():
+            real_port = _db.load_portfolio("real")
             real_val = portfolio_value(real_port, quotes)
             real_w = portfolio_weights(real_port, quotes)
+            real_on = is_real_trading_enabled()
+            real_action = action if real_on else "Observe (real trading disabled)"
+            real_note = (
+                real_intent_summary
+                or (
+                    "MCP-assisted: intents queued for confirmation"
+                    if real_on and action in ("Initialize", "Rebalance")
+                    else "Real tab report only — no auto trades while real_trading_enabled=false"
+                )
+            )
+            # Strategy log for real tab (mirrors paper decision, notes intent status)
+            append_log_row({
+                "Date": today,
+                "Session": session_label,
+                "Regime_Tier": tier,
+                "Recommended_QQQ_%": targets["QQQ"],
+                "Recommended_USO_%": targets["USO"],
+                "Recommended_GLD_%": targets["GLD"],
+                "Recommended_CASH_%": targets.get("CASH", 0),
+                "Current_Portfolio_Value": real_val if real_val else "",
+                "QQQ_Price": quotes["QQQ"]["price"],
+                "USO_Price": quotes["USO"]["price"],
+                "GLD_Price": quotes["GLD"]["price"],
+                "Rationale_Summary": build_rationale(tier, confidence, session, signals),
+                "Gold_Oil_Ratio": gold_oil,
+                "Key_Signals": "; ".join(signals),
+                "Suggested_Action": real_action,
+                "Rebalance_Note": real_note,
+            }, "real")
+
             real_struct = {
                 "date": today,
                 "tab": "real",
@@ -856,8 +915,10 @@ def run(session: str) -> int:
                 "key_signals": signals,
                 "quant_tier": tier,
                 "quant_targets": targets,
-                "quant_action": "Observe (real trading disabled)",
-                "quant_note": "Real tab report only — no auto trades while real_trading_enabled=false",
+                "quant_action": real_action,
+                "quant_note": real_note,
+                "pending_intents": real_intent_summary,
+                "confirm_required": True,
             }
             real_llm = call_xai_for_report("real", session_label, real_struct, previous, headlines, agent_prompt)
             if not real_llm.startswith("LLM_"):
@@ -867,8 +928,12 @@ def run(session: str) -> int:
                 real_fallback = (
                     f"# Daily 3-Tier Regime Report — {today} ({session_label}) — real tab\n\n"
                     "(Direct LLM call skipped or errored; using quant signals.)\n\n"
-                    f"## Regime\n- Tier {tier}\n\n## Allocation targets\n{targets}\n\n"
-                    f"## Current real portfolio value\n${real_val:,.0f}\n"
+                    f"## Regime\n- Tier {tier}\n- Action: {real_action}\n\n"
+                    f"## Allocation targets\n{targets}\n\n"
+                    f"## Current real portfolio value\n${real_val:,.0f}\n\n"
+                    f"## Intents\n{real_note}\n\n"
+                    "**No orders are placed automatically.** Confirm pending intents "
+                    "in Grok via Robinhood MCP before any real money moves.\n"
                 )
                 write_report(real_fallback, today, f"{session}_real", "real")
     except Exception as e:

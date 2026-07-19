@@ -10,6 +10,10 @@
     "job:close": "python3 scripts/daily_regime_job.py --session close",
     "schedule:install": "bash scripts/install_schedule.sh",
     "paper:init": "python3 scripts/paper_trade.py --init",
+    "real:enable": "python3 scripts/real_trade.py --enable",
+    "real:disable": "python3 scripts/real_trade.py --disable",
+    "real:pending": "python3 scripts/real_trade.py --list-pending",
+    "real:payloads": "python3 scripts/real_trade.py --show-mcp-payloads",
     "build": "vite build",
     "preview": "vite preview"
   },

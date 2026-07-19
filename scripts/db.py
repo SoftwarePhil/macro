@@ -167,7 +167,38 @@ CREATE TABLE IF NOT EXISTS llm_reports (
     report_text TEXT NOT NULL,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+-- Real-trading intent queue. Jobs write pending rows; humans confirm via MCP.
+CREATE TABLE IF NOT EXISTS pending_orders (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tab_id          TEXT NOT NULL DEFAULT 'real',
+    created_at      TEXT NOT NULL,
+    date            TEXT NOT NULL,
+    session         TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    side            TEXT NOT NULL,          -- BUY | SELL
+    shares          REAL NOT NULL,
+    price           REAL NOT NULL,          -- estimate at intent time
+    notional        REAL NOT NULL,
+    reason          TEXT,
+    tier            INTEGER,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    -- pending | cancelled | placed | rejected | expired
+    account_number  TEXT,
+    ref_id          TEXT,                  -- client idempotency UUID for place_equity_order
+    broker_order_id TEXT,                  -- Robinhood order id after place
+    placed_at       TEXT,
+    error_message   TEXT,
+    job_run_id      INTEGER
+);
+CREATE INDEX IF NOT EXISTS pending_orders_status
+    ON pending_orders(tab_id, status, created_at DESC);
 """
+
+# Lightweight migrations for DBs created before newer columns/tables.
+_MIGRATIONS = [
+    "ALTER TABLE portfolio_meta ADD COLUMN broker_account TEXT",
+]
 
 
 def connect() -> sqlite3.Connection:
@@ -175,6 +206,12 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    for sql in _MIGRATIONS:
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
     return conn
 
 
@@ -308,8 +345,8 @@ def save_portfolio(portfolio: dict, tab_id: str = "paper",
         c.execute("""
             INSERT INTO portfolio_meta
                 (tab_id, account_name, source, mode, starting_capital,
-                 started_at, cash, last_synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 started_at, cash, last_synced, broker_account)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tab_id) DO UPDATE SET
                 account_name=excluded.account_name,
                 source=excluded.source,
@@ -317,7 +354,8 @@ def save_portfolio(portfolio: dict, tab_id: str = "paper",
                 starting_capital=excluded.starting_capital,
                 started_at=excluded.started_at,
                 cash=excluded.cash,
-                last_synced=excluded.last_synced
+                last_synced=excluded.last_synced,
+                broker_account=COALESCE(excluded.broker_account, portfolio_meta.broker_account)
         """, (
             tab_id,
             portfolio.get("account_name", "Paper Trading (Mock)"),
@@ -327,7 +365,10 @@ def save_portfolio(portfolio: dict, tab_id: str = "paper",
             portfolio.get("started_at"),
             float(portfolio.get("cash", 0)),
             now,
+            portfolio.get("broker_account"),
         ))
+        if portfolio.get("replace_positions"):
+            c.execute("DELETE FROM positions WHERE tab_id=?", (tab_id,))
         for h in portfolio.get("holdings", []):
             c.execute("""
                 INSERT INTO positions (tab_id, symbol, shares, avg_cost)
@@ -662,3 +703,144 @@ def load_latest_llm_report(tab_id: str,
         LIMIT 1
     """, (tab_id,)).fetchone()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# pending_orders (real MCP-assisted execution queue)
+# ---------------------------------------------------------------------------
+
+def insert_pending_orders(orders: list[dict],
+                          conn: sqlite3.Connection | None = None) -> list[int]:
+    """Insert pending order intents. Returns new row ids."""
+    c = conn or get_conn()
+    ids: list[int] = []
+    with c:
+        for o in orders:
+            cur = c.execute("""
+                INSERT INTO pending_orders
+                    (tab_id, created_at, date, session, symbol, side,
+                     shares, price, notional, reason, tier, status,
+                     account_number, ref_id, job_run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                o.get("tab_id", "real"),
+                o["created_at"],
+                o["date"],
+                o["session"],
+                o["symbol"],
+                o["side"],
+                float(o["shares"]),
+                float(o["price"]),
+                float(o["notional"]),
+                o.get("reason", ""),
+                int(o["tier"]) if o.get("tier") is not None else None,
+                o.get("status", "pending"),
+                o.get("account_number"),
+                o.get("ref_id"),
+                o.get("job_run_id"),
+            ))
+            ids.append(cur.lastrowid)
+    return ids
+
+
+def load_pending_orders(
+    tab_id: str = "real",
+    status: str | None = "pending",
+    limit: int = 50,
+    conn: sqlite3.Connection | None = None,
+) -> list[dict]:
+    c = conn or get_conn()
+    if status:
+        rows = c.execute("""
+            SELECT * FROM pending_orders
+            WHERE tab_id=? AND status=?
+            ORDER BY id DESC LIMIT ?
+        """, (tab_id, status, limit)).fetchall()
+    else:
+        rows = c.execute("""
+            SELECT * FROM pending_orders
+            WHERE tab_id=?
+            ORDER BY id DESC LIMIT ?
+        """, (tab_id, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_pending_orders(tab_id: str = "real", status: str = "pending",
+                         conn: sqlite3.Connection | None = None) -> int:
+    c = conn or get_conn()
+    return c.execute(
+        "SELECT COUNT(*) FROM pending_orders WHERE tab_id=? AND status=?",
+        (tab_id, status),
+    ).fetchone()[0]
+
+
+def get_pending_order(order_id: int,
+                      conn: sqlite3.Connection | None = None) -> dict | None:
+    c = conn or get_conn()
+    row = c.execute(
+        "SELECT * FROM pending_orders WHERE id=?", (order_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def update_pending_order_status(
+    order_id: int,
+    status: str,
+    broker_order_id: str | None = None,
+    error_message: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    """Update status of a pending order. Returns True if a row was updated."""
+    c = conn or get_conn()
+    now = datetime.now(ET).isoformat()
+    placed_at = now if status == "placed" else None
+    cur = c.execute("""
+        UPDATE pending_orders
+        SET status=?,
+            broker_order_id=COALESCE(?, broker_order_id),
+            error_message=COALESCE(?, error_message),
+            placed_at=COALESCE(?, placed_at)
+        WHERE id=?
+    """, (status, broker_order_id, error_message, placed_at, order_id))
+    c.commit()
+    return cur.rowcount > 0
+
+
+def cancel_pending_orders(
+    tab_id: str = "real",
+    before_date: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Expire/cancel open pending intents. Optionally only those before a date."""
+    c = conn or get_conn()
+    if before_date:
+        cur = c.execute("""
+            UPDATE pending_orders
+            SET status='expired'
+            WHERE tab_id=? AND status='pending' AND date < ?
+        """, (tab_id, before_date))
+    else:
+        cur = c.execute("""
+            UPDATE pending_orders
+            SET status='cancelled'
+            WHERE tab_id=? AND status='pending'
+        """, (tab_id,))
+    c.commit()
+    return cur.rowcount
+
+
+def supersede_pending_for_session(
+    tab_id: str,
+    date: str,
+    session: str,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Mark prior pending intents for this session as expired (re-run replace)."""
+    c = conn or get_conn()
+    cur = c.execute("""
+        UPDATE pending_orders
+        SET status='expired'
+        WHERE tab_id=? AND status='pending' AND date=? AND session=?
+    """, (tab_id, date, session))
+    c.commit()
+    return cur.rowcount

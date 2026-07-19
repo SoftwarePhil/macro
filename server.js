@@ -22,6 +22,11 @@ import {
   loadJobRuns,
   loadJobRunById,
   loadLlmReportById,
+  loadPendingOrders,
+  countPendingOrders,
+  getPendingOrder,
+  updatePendingOrderStatus,
+  cancelPendingOrders,
 } from "./db.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -375,6 +380,10 @@ async function buildDashboardPayload() {
     // LLM report
     const tabLLMReport = loadTabLlmReport(tabId, tabLatest?.Date, tabLatest?.Session);
 
+    const isReal = tab.type === "robinhood" || tabId === "real";
+    const pending = isReal ? loadPendingOrders(tabId, "pending", 50) : [];
+    const pendingCount = isReal ? countPendingOrders(tabId, "pending") : 0;
+
     tabData[tabId] = {
       enabled: !!tab.enabled,
       realTradingEnabled: !!tab.real_trading_enabled,
@@ -384,6 +393,8 @@ async function buildDashboardPayload() {
       returnDollar: tabReturnDollar,
       tradeCount: countTrades(tabId),
       trades: tabTrades,
+      pendingOrders: pending,
+      pendingCount,
       equity: tabEquity,
       chartSeries: tabChartSeries,
       portfolio: {
@@ -392,6 +403,7 @@ async function buildDashboardPayload() {
         accountName: tabPortfolioRaw.account_name || (tab.type === "robinhood" ? "Real Robinhood" : "Paper"),
         source: tabPortfolioRaw.source || tab.type,
         lastSynced: tabPortfolioRaw.last_synced || null,
+        brokerAccount: tabPortfolioRaw.broker_account || null,
       },
       drift: {
         vsRecommended: tabDriftVsRecommended,
@@ -565,6 +577,213 @@ app.post("/api/live-prices", (req, res) => {
   });
   tx();
   res.json({ ok: true, updated: Object.keys(prices), source: "mcp", storedIn: "sqlite:quotes" });
+});
+
+// ---------------------------------------------------------------------------
+// Real trading — pending intents + portfolio sync (MCP-assisted)
+// ---------------------------------------------------------------------------
+
+const STRATEGY_ASSETS = ["QQQ", "USO", "GLD"];
+
+app.get("/api/pending-orders", (req, res) => {
+  const tabId = req.query.tab || "real";
+  const status = req.query.status === "all" ? null : (req.query.status || "pending");
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  res.json({
+    orders: loadPendingOrders(tabId, status, limit),
+    pendingCount: countPendingOrders(tabId, "pending"),
+  });
+});
+
+app.post("/api/pending-orders/:id/placed", (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id) || id <= 0) {
+    return res.status(400).json({ error: "invalid id" });
+  }
+  const row = getPendingOrder(id);
+  if (!row) return res.status(404).json({ error: "not found" });
+  if (row.status !== "pending") {
+    return res.status(409).json({ error: `order is already ${row.status}` });
+  }
+  const brokerOrderId = req.body?.broker_order_id || req.body?.order_id || null;
+  updatePendingOrderStatus(id, "placed", { broker_order_id: brokerOrderId });
+  // Mirror into trades log for real tab history
+  const db = getDb();
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO trades
+      (tab_id, timestamp, date, session, symbol, side, shares, price, notional, reason)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    row.tab_id,
+    now,
+    row.date,
+    row.session,
+    row.symbol,
+    row.side,
+    row.shares,
+    row.price,
+    row.notional,
+    row.reason || `MCP placed (${brokerOrderId || id})`,
+  );
+  res.json({ ok: true, order: getPendingOrder(id) });
+});
+
+app.post("/api/pending-orders/:id/reject", (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id) || id <= 0) {
+    return res.status(400).json({ error: "invalid id" });
+  }
+  const row = getPendingOrder(id);
+  if (!row) return res.status(404).json({ error: "not found" });
+  updatePendingOrderStatus(id, "rejected", {
+    error_message: req.body?.error || req.body?.error_message || "rejected",
+  });
+  res.json({ ok: true, order: getPendingOrder(id) });
+});
+
+app.post("/api/pending-orders/:id/cancel", (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id) || id <= 0) {
+    return res.status(400).json({ error: "invalid id" });
+  }
+  const row = getPendingOrder(id);
+  if (!row) return res.status(404).json({ error: "not found" });
+  if (row.status !== "pending") {
+    return res.status(409).json({ error: `order is already ${row.status}` });
+  }
+  updatePendingOrderStatus(id, "cancelled");
+  res.json({ ok: true, order: getPendingOrder(id) });
+});
+
+app.post("/api/pending-orders/cancel-all", (req, res) => {
+  const tabId = req.body?.tab || req.query.tab || "real";
+  const n = cancelPendingOrders(tabId);
+  res.json({ ok: true, cancelled: n });
+});
+
+/**
+ * Push real portfolio snapshot from Robinhood MCP into the real tab.
+ * Body: { account_number, account_name?, cash, holdings: [{symbol, shares, avg_cost}], starting_capital? }
+ */
+app.post("/api/real/sync-portfolio", (req, res) => {
+  const body = req.body || {};
+  const cash = Number(body.cash ?? 0);
+  if (!Number.isFinite(cash)) {
+    return res.status(400).json({ error: "cash must be a number" });
+  }
+  const holdingsIn = body.holdings || body.positions || [];
+  if (!Array.isArray(holdingsIn)) {
+    return res.status(400).json({ error: "holdings array required" });
+  }
+
+  const bySym = {};
+  for (const h of holdingsIn) {
+    const sym = String(h.symbol || "").toUpperCase();
+    if (!sym) continue;
+    bySym[sym] = {
+      symbol: sym,
+      shares: Number(h.shares ?? h.quantity ?? 0),
+      avg_cost: Number(h.avg_cost ?? h.average_cost ?? h.average_buy_price ?? 0),
+    };
+  }
+  const holdings = STRATEGY_ASSETS.map(
+    (sym) => bySym[sym] || { symbol: sym, shares: 0, avg_cost: 0 },
+  );
+  for (const [sym, h] of Object.entries(bySym)) {
+    if (!STRATEGY_ASSETS.includes(sym)) holdings.push(h);
+  }
+
+  const existing = loadPortfolio("real");
+  const starting = body.starting_capital != null
+    ? Number(body.starting_capital)
+    : (existing.starting_capital || cash);
+
+  savePortfolio({
+    account_name: body.account_name || existing.account_name || "Robinhood Agentic",
+    source: "robinhood_mcp",
+    mode: "real",
+    starting_capital: starting,
+    started_at: existing.started_at || new Date().toISOString().slice(0, 10),
+    cash,
+    broker_account: body.account_number || body.broker_account || existing.broker_account || null,
+    holdings,
+    replace_positions: true,
+  }, "real");
+
+  // Enable real tab for viewing if a sync came in
+  const tabs = loadTabConfig();
+  const realTab = tabs.find((t) => t.tab_id === "real");
+  if (realTab) {
+    upsertTabConfig({
+      ...realTab,
+      tab_id: "real",
+      enabled: true,
+      // leave real_trading_enabled as-is — intent gen is a separate switch
+    });
+  }
+
+  res.json({ ok: true, portfolio: loadPortfolio("real") });
+});
+
+/** Enable/disable real trading intent generation (never auto-places). */
+app.post("/api/real/config", (req, res) => {
+  const body = req.body || {};
+  const tabs = loadTabConfig();
+  const realTab = tabs.find((t) => t.tab_id === "real") || {
+    tab_id: "real",
+    label: "Real (Robinhood)",
+    type: "robinhood",
+    enabled: 0,
+    real_trading_enabled: 0,
+    starting_capital: 0,
+    max_step_pct: 5,
+    use_real_prices: 0,
+    started_at: null,
+  };
+
+  const next = {
+    tab_id: "real",
+    label: body.label || realTab.label || "Real (Robinhood)",
+    type: "robinhood",
+    enabled: body.enabled != null ? !!body.enabled : true,
+    real_trading_enabled: body.real_trading_enabled != null
+      ? !!body.real_trading_enabled
+      : !!realTab.real_trading_enabled,
+    starting_capital: body.starting_capital != null
+      ? Number(body.starting_capital)
+      : Number(realTab.starting_capital || 0),
+    max_step_pct: body.max_step_pct != null
+      ? Number(body.max_step_pct)
+      : Number(realTab.max_step_pct || 5),
+    use_real_prices: body.use_real_prices != null
+      ? !!body.use_real_prices
+      : true,
+    started_at: realTab.started_at || new Date().toISOString().slice(0, 10),
+  };
+  upsertTabConfig(next);
+
+  if (body.account_number) {
+    const port = loadPortfolio("real");
+    savePortfolio({
+      ...port,
+      account_name: port.account_name || "Robinhood Agentic",
+      source: "robinhood_mcp",
+      mode: "real",
+      broker_account: body.account_number,
+      holdings: port.holdings || STRATEGY_ASSETS.map((s) => ({ symbol: s, shares: 0, avg_cost: 0 })),
+    }, "real");
+  }
+
+  if (body.real_trading_enabled === false) {
+    cancelPendingOrders("real");
+  }
+
+  res.json({
+    ok: true,
+    config: loadTabConfig().find((t) => t.tab_id === "real"),
+    portfolio: loadPortfolio("real"),
+  });
 });
 
 if (process.env.NODE_ENV === "production") {

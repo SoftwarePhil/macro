@@ -151,7 +151,35 @@ CREATE TABLE IF NOT EXISTS llm_reports (
     report_text TEXT NOT NULL,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+CREATE TABLE IF NOT EXISTS pending_orders (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tab_id          TEXT NOT NULL DEFAULT 'real',
+    created_at      TEXT NOT NULL,
+    date            TEXT NOT NULL,
+    session         TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    side            TEXT NOT NULL,
+    shares          REAL NOT NULL,
+    price           REAL NOT NULL,
+    notional        REAL NOT NULL,
+    reason          TEXT,
+    tier            INTEGER,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    account_number  TEXT,
+    ref_id          TEXT,
+    broker_order_id TEXT,
+    placed_at       TEXT,
+    error_message   TEXT,
+    job_run_id      INTEGER
+);
+CREATE INDEX IF NOT EXISTS pending_orders_status
+    ON pending_orders(tab_id, status, created_at DESC);
 `;
+
+const MIGRATIONS = [
+  "ALTER TABLE portfolio_meta ADD COLUMN broker_account TEXT",
+];
 
 let _db = null;
 
@@ -159,6 +187,13 @@ export function getDb() {
   if (!_db) {
     _db = new Database(DB_PATH);
     _db.exec(SCHEMA);
+    for (const sql of MIGRATIONS) {
+      try {
+        _db.exec(sql);
+      } catch {
+        // column already exists
+      }
+    }
   }
   return _db;
 }
@@ -274,14 +309,15 @@ export function savePortfolio(portfolio, tabId = "paper") {
     db.prepare(`
       INSERT INTO portfolio_meta
           (tab_id, account_name, source, mode, starting_capital,
-           started_at, cash, last_synced)
+           started_at, cash, last_synced, broker_account)
       VALUES (@tab_id, @account_name, @source, @mode, @starting_capital,
-              @started_at, @cash, @last_synced)
+              @started_at, @cash, @last_synced, @broker_account)
       ON CONFLICT(tab_id) DO UPDATE SET
           account_name=excluded.account_name, source=excluded.source,
           mode=excluded.mode, starting_capital=excluded.starting_capital,
           started_at=excluded.started_at, cash=excluded.cash,
-          last_synced=excluded.last_synced
+          last_synced=excluded.last_synced,
+          broker_account=COALESCE(excluded.broker_account, portfolio_meta.broker_account)
     `).run({
       tab_id: tabId,
       account_name: portfolio.account_name || "Paper Trading (Mock)",
@@ -291,7 +327,11 @@ export function savePortfolio(portfolio, tabId = "paper") {
       started_at: portfolio.started_at || null,
       cash: Number(portfolio.cash || 0),
       last_synced: now,
+      broker_account: portfolio.broker_account || null,
     });
+    if (portfolio.replace_positions) {
+      db.prepare("DELETE FROM positions WHERE tab_id=?").run(tabId);
+    }
     for (const h of (portfolio.holdings || [])) {
       db.prepare(`
         INSERT INTO positions (tab_id, symbol, shares, avg_cost)
@@ -491,4 +531,59 @@ export function loadLatestLlmReport(tabId) {
     LIMIT 1
   `).get(tabId);
   return row || null;
+}
+
+// ---------------------------------------------------------------------------
+// pending_orders (real MCP-assisted execution queue)
+// ---------------------------------------------------------------------------
+
+export function loadPendingOrders(tabId = "real", status = "pending", limit = 50) {
+  if (status) {
+    return getDb().prepare(`
+      SELECT * FROM pending_orders
+      WHERE tab_id=? AND status=?
+      ORDER BY id DESC LIMIT ?
+    `).all(tabId, status, limit);
+  }
+  return getDb().prepare(`
+    SELECT * FROM pending_orders
+    WHERE tab_id=?
+    ORDER BY id DESC LIMIT ?
+  `).all(tabId, limit);
+}
+
+export function countPendingOrders(tabId = "real", status = "pending") {
+  return getDb().prepare(
+    "SELECT COUNT(*) AS n FROM pending_orders WHERE tab_id=? AND status=?"
+  ).get(tabId, status).n;
+}
+
+export function getPendingOrder(orderId) {
+  return getDb().prepare(
+    "SELECT * FROM pending_orders WHERE id=?"
+  ).get(orderId) || null;
+}
+
+export function updatePendingOrderStatus(orderId, status, {
+  broker_order_id = null,
+  error_message = null,
+} = {}) {
+  const placedAt = status === "placed" ? new Date().toISOString() : null;
+  const result = getDb().prepare(`
+    UPDATE pending_orders
+    SET status=?,
+        broker_order_id=COALESCE(?, broker_order_id),
+        error_message=COALESCE(?, error_message),
+        placed_at=COALESCE(?, placed_at)
+    WHERE id=?
+  `).run(status, broker_order_id, error_message, placedAt, orderId);
+  return result.changes > 0;
+}
+
+export function cancelPendingOrders(tabId = "real") {
+  const result = getDb().prepare(`
+    UPDATE pending_orders SET status='cancelled'
+    WHERE tab_id=? AND status='pending'
+  `).run(tabId);
+  return result.changes;
 }

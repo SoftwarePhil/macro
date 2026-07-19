@@ -86,6 +86,12 @@ def init_paper(starting_capital: float = 100_000.0,
     start_date = started_at or datetime.now(ET).strftime("%Y-%m-%d")
     conn = _db.get_conn()
 
+    # Snapshot real-tab settings before we rewrite paper defaults
+    existing_real = next(
+        (t for t in _db.load_tab_config(conn) if t.get("tab_id") == "real"),
+        None,
+    )
+
     # Write tab configs
     _db.upsert_tab_config({
         "tab_id": "paper",
@@ -98,21 +104,37 @@ def init_paper(starting_capital: float = 100_000.0,
         "use_real_prices": False,
         "started_at": start_date,
     }, conn)
-    _db.upsert_tab_config({
-        "tab_id": "real",
-        "label": "Real (Robinhood)",
-        "type": "robinhood",
-        "enabled": False,
-        "real_trading_enabled": False,
-        "starting_capital": 0,
-        "max_step_pct": 5,
-        "use_real_prices": False,
-        "started_at": None,
-    }, conn)
+
+    if existing_real and existing_real.get("real_trading_enabled"):
+        # Keep MCP-assisted real trading config intact across paper resets
+        _db.upsert_tab_config({
+            "tab_id": "real",
+            "label": existing_real.get("label") or "Real (Robinhood)",
+            "type": "robinhood",
+            "enabled": bool(existing_real.get("enabled")),
+            "real_trading_enabled": True,
+            "starting_capital": float(existing_real.get("starting_capital") or 0),
+            "max_step_pct": float(existing_real.get("max_step_pct") or 5),
+            "use_real_prices": bool(existing_real.get("use_real_prices")),
+            "started_at": existing_real.get("started_at"),
+        }, conn)
+    else:
+        _db.upsert_tab_config({
+            "tab_id": "real",
+            "label": "Real (Robinhood)",
+            "type": "robinhood",
+            "enabled": False,
+            "real_trading_enabled": False,
+            "starting_capital": 0,
+            "max_step_pct": 5,
+            "use_real_prices": False,
+            "started_at": None,
+        }, conn)
 
     portfolio = default_portfolio(starting_capital)
     portfolio["started_at"] = start_date
     _db.save_portfolio(portfolio, TAB_ID, conn)
+
     return portfolio
 
 
@@ -148,50 +170,54 @@ def portfolio_weights(portfolio: dict, quotes: dict[str, dict]) -> dict[str, flo
 
 
 # ---------------------------------------------------------------------------
-# Execute rebalance
+# Plan rebalance (pure — no I/O). Shared by paper fill + real pending intents.
 # ---------------------------------------------------------------------------
 
-def execute_rebalance(
+def plan_rebalance(
     portfolio: dict,
     quotes: dict[str, dict],
     targets: dict[str, int],
     session: str,
     tier: int,
     action: str,
+    max_step_pct: float = 5.0,
+    mutate: bool = True,
 ) -> tuple[dict, list[dict]]:
-    """Execute capped paper trades toward target allocation. All writes are atomic.
+    """Plan capped trades toward target allocation.
+
+    When mutate=True, updates portfolio cash/holdings in place (paper path).
+    When mutate=False, returns the planned trades without changing portfolio
+    (real pending-intent path).
 
     targets may include a 'CASH' key. The CASH target is not traded — it
     simply reduces the investable budget so that remaining cash stays parked.
-    Example: targets = {QQQ:60, USO:0, GLD:25, CASH:15} means 15% of the
-    portfolio is intentionally held as cash and the remaining 85% is deployed
-    across the three ETFs.
     """
     if action == "Hold":
         return portfolio, []
 
-    cfg = load_config()
-    max_step_pct = float(cfg.get("max_step_pct", 5))
+    import copy
+    work = portfolio if mutate else copy.deepcopy(portfolio)
+
     now = datetime.now(ET)
     today = now.strftime("%Y-%m-%d")
     stamp = now.isoformat()
-    holdings = _holding_map(portfolio)
-    cash = float(portfolio.get("cash") or 0)
-    total = portfolio_value(portfolio, quotes)
+    holdings = _holding_map(work)
+    # Ensure all ASSETS exist as holding stubs
+    for sym in ASSETS:
+        if sym not in holdings:
+            holdings[sym] = {"symbol": sym, "shares": 0.0, "avg_cost": 0.0}
+            work.setdefault("holdings", []).append(holdings[sym])
+
+    cash = float(work.get("cash") or 0)
+    total = portfolio_value(work, quotes)
     if total <= 0:
-        return portfolio, []
+        return portfolio if not mutate else work, []
 
     max_step = total * max_step_pct / 100
-
-    # The CASH target reserves a fraction of total as uninvested cash.
-    # investable_total is the denominator used to size positions.
     cash_target_pct = float(targets.get("CASH", 0))
     investable_pct = max(0.0, 100.0 - cash_target_pct)
-    # Asset targets rescaled to sum to investable_pct
-    # (they already should, but we normalise defensively)
     asset_sum = sum(targets.get(s, 0) for s in ASSETS)
     if asset_sum > 0 and abs(asset_sum - investable_pct) > 2:
-        # Targets don't sum correctly with the CASH split — rescale
         scale = investable_pct / asset_sum
         effective_targets = {s: round(targets.get(s, 0) * scale) for s in ASSETS}
     else:
@@ -201,7 +227,7 @@ def execute_rebalance(
 
     # 1) Sells first (overweight assets)
     for sym in ASSETS:
-        price = quotes[sym]["price"]
+        price = float(quotes.get(sym, {}).get("price") or 0)
         if price <= 0:
             continue
         h = holdings[sym]
@@ -219,7 +245,9 @@ def execute_rebalance(
         notional = round(sell_shares * price, 2)
         h["shares"] = round(shares - sell_shares, 4)
         cash += notional
-        label = f"{targets.get(sym, 0)}%" + (f" [CASH target: {cash_target_pct:.0f}%]" if cash_target_pct else "")
+        label = f"{targets.get(sym, 0)}%" + (
+            f" [CASH target: {cash_target_pct:.0f}%]" if cash_target_pct else ""
+        )
         trades.append({
             "Timestamp": stamp,
             "Date": today,
@@ -232,20 +260,19 @@ def execute_rebalance(
             "Reason": f"{action} toward Tier {tier} ({label})",
         })
 
-    portfolio["cash"] = round(cash, 2)
+    work["cash"] = round(cash, 2)
 
     # Recompute after sells
-    total = portfolio_value(portfolio, quotes)
+    total = portfolio_value(work, quotes)
     max_step = total * max_step_pct / 100
-    cash = float(portfolio.get("cash") or 0)
+    cash = float(work.get("cash") or 0)
 
     # 2) Buys (underweight assets)
-    # Cash available for investment = cash minus the amount we want to keep parked
     cash_to_keep = total * cash_target_pct / 100
     deployable_cash = max(0.0, cash - cash_to_keep)
 
     for sym in ASSETS:
-        price = quotes[sym]["price"]
+        price = float(quotes.get(sym, {}).get("price") or 0)
         if price <= 0 or deployable_cash < 1:
             continue
         h = holdings[sym]
@@ -271,7 +298,9 @@ def execute_rebalance(
         h["shares"] = round(new_shares, 4)
         cash -= notional
         deployable_cash -= notional
-        label = f"{targets.get(sym, 0)}%" + (f" [CASH target: {cash_target_pct:.0f}%]" if cash_target_pct else "")
+        label = f"{targets.get(sym, 0)}%" + (
+            f" [CASH target: {cash_target_pct:.0f}%]" if cash_target_pct else ""
+        )
         trades.append({
             "Timestamp": stamp,
             "Date": today,
@@ -284,10 +313,39 @@ def execute_rebalance(
             "Reason": f"{action} toward Tier {tier} ({label})",
         })
 
-    portfolio["cash"] = round(cash, 2)
-    portfolio["last_synced"] = stamp
+    work["cash"] = round(cash, 2)
+    work["last_synced"] = stamp
+    return work, trades
 
-    # Write portfolio + trades + equity snapshot in a single transaction
+
+# ---------------------------------------------------------------------------
+# Execute rebalance (paper — applies plan + writes)
+# ---------------------------------------------------------------------------
+
+def execute_rebalance(
+    portfolio: dict,
+    quotes: dict[str, dict],
+    targets: dict[str, int],
+    session: str,
+    tier: int,
+    action: str,
+) -> tuple[dict, list[dict]]:
+    """Execute capped paper trades toward target allocation. All writes are atomic."""
+    if action == "Hold":
+        return portfolio, []
+
+    cfg = load_config()
+    max_step_pct = float(cfg.get("max_step_pct", 5))
+    portfolio, trades = plan_rebalance(
+        portfolio, quotes, targets, session, tier, action,
+        max_step_pct=max_step_pct, mutate=True,
+    )
+    if not trades:
+        return portfolio, []
+
+    now = datetime.now(ET)
+    today = now.strftime("%Y-%m-%d")
+
     conn = _db.get_conn()
     with conn:
         _db.save_portfolio(portfolio, TAB_ID, conn)

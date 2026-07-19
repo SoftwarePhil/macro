@@ -392,8 +392,10 @@ function escapeHtml(str) {
     .replace(/>/g, "&gt;");
 }
 
-function tradesTable(trades) {
-  if (!trades?.length) return `<p class="stat-sub">No paper trades yet — next open/close job will build positions.</p>`;
+function tradesTable(trades, emptyMsg) {
+  if (!trades?.length) {
+    return `<p class="stat-sub">${emptyMsg || "No paper trades yet — next open/close job will build positions."}</p>`;
+  }
   const rows = trades
     .slice(0, 20)
     .map(
@@ -401,7 +403,7 @@ function tradesTable(trades) {
       <tr>
         <td>${t.Date}</td>
         <td>${t.Session}</td>
-        <td class="sym ${t.Symbol.toLowerCase()}">${t.Symbol}</td>
+        <td class="sym ${String(t.Symbol || "").toLowerCase()}">${t.Symbol}</td>
         <td>${t.Side}</td>
         <td class="mono">${Number(t.Shares).toFixed(4)}</td>
         <td class="mono">${fmtPrice(Number(t.Price))}</td>
@@ -421,6 +423,47 @@ function tradesTable(trades) {
   `;
 }
 
+function pendingOrdersTable(orders) {
+  if (!orders?.length) {
+    return `<p class="stat-sub">No pending real-trade intents. Jobs queue intents when drift &gt; 5% and real trading is enabled.</p>`;
+  }
+  const rows = orders
+    .map((o) => {
+      const side = String(o.side || "").toUpperCase();
+      return `
+      <tr>
+        <td class="mono">#${o.id}</td>
+        <td>${o.date || ""}</td>
+        <td>${o.session || ""}</td>
+        <td class="sym ${String(o.symbol || "").toLowerCase()}">${o.symbol}</td>
+        <td class="${side === "BUY" ? "positive" : "negative"}">${side}</td>
+        <td class="mono">${Number(o.shares).toFixed(4)}</td>
+        <td class="mono">${fmtMoney(Number(o.notional))}</td>
+        <td class="small">${o.reason || ""}</td>
+      </tr>`;
+    })
+    .join("");
+  return `
+    <div class="alert" style="margin-bottom:10px">
+      <strong>${orders.length} pending intent(s)</strong> — nothing is placed until you confirm in Grok via Robinhood MCP.
+      Say: <em>“review and place pending real trades on my Agentic account”</em>.
+    </div>
+    <div class="trades-table">
+      <table>
+        <thead><tr><th>ID</th><th>Date</th><th>Session</th><th>Symbol</th><th>Side</th><th>Shares</th><th>Notional</th><th>Reason</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function maskAccount(acct) {
+  if (!acct) return "—";
+  const s = String(acct);
+  if (s.length <= 4) return s;
+  return `••••${s.slice(-4)}`;
+}
+
 function renderMain() {
   const d = state.data;
   const { regime, market } = d;
@@ -430,9 +473,16 @@ function renderMain() {
   const drift = thisTabData.drift || { vsRecommended: [], vsTier: [], maxDrift: 0, rebalanceNeeded: false };
   const portfolio = thisTabData.portfolio || { positions: [], totalValue: 0, invested: 0, cash: 0, weights: {} };
   const isRealTypeTab = currentTab.type === 'robinhood' || currentTab.id === 'real';
-  const showEmptyReal = isRealTypeTab && !currentTab.real_trading_enabled;
+  const realEnabled = !!(currentTab.real_trading_enabled || thisTabData.realTradingEnabled);
+  const hasRealPortfolio = isRealTypeTab && (
+    (portfolio.totalValue || 0) > 0 ||
+    (portfolio.cash || 0) > 0 ||
+    (portfolio.positions || []).some((p) => Number(p.shares) > 0) ||
+    portfolio.lastSynced
+  );
+  const showEmptyReal = isRealTypeTab && !realEnabled && !hasRealPortfolio;
   const action = drift.rebalanceNeeded
-    ? `<div class="alert">Rebalance suggested — max drift ${fmtPct(drift.maxDrift)} exceeds 5% threshold. Cap moves at 5–10% per day.</div>`
+    ? `<div class="alert">Rebalance suggested — max drift ${fmtPct(drift.maxDrift)} exceeds 5% threshold. Cap moves at 5–10% per day.${isRealTypeTab ? " Real intents require MCP confirmation." : ""}</div>`
     : `<div class="alert ok">Within drift tolerance — Hold current allocation.</div>`;
 
   return `
@@ -444,6 +494,8 @@ function renderMain() {
       </div>
       <div class="header-actions">
         ${!isRealTypeTab && thisTabData.enabled ? `<span class="badge paper">Paper · $${(thisTabData.startingCapital / 1000).toFixed(0)}k mock</span>` : ""}
+        ${isRealTypeTab && realEnabled ? `<span class="badge paper" style="background:#1e3a5f">Real · MCP confirm</span>` : ""}
+        ${isRealTypeTab && (thisTabData.pendingCount || 0) > 0 ? `<span class="badge" style="background:#78350f;color:#fde68a">${thisTabData.pendingCount} pending</span>` : ""}
         ${tierBadge(regime.tier, regime.name)}
         <button type="button" id="btn-refresh">Refresh</button>
         ${!isRealTypeTab && !thisTabData.enabled ? `<button type="button" id="btn-edit">Edit Holdings</button>` : ""}
@@ -456,7 +508,7 @@ function renderMain() {
       `).join('') : ''}
     </div>
 
-    ${!isRealTypeTab && thisTabData.enabled ? `
+    ${((!isRealTypeTab && thisTabData.enabled) || (isRealTypeTab && hasRealPortfolio)) ? `
     <div class="card chart-card" style="margin-bottom:16px">
       <div class="chart-hero">
         <div class="chart-hero-value mono" id="chart-hero-value">${fmtMoney(thisTabData.portfolio ? thisTabData.portfolio.totalValue : 0)}</div>
@@ -469,7 +521,7 @@ function renderMain() {
         <div class="chart-ranges">
           ${["1D", "1W", "1M", "ALL"].map((r) => `<button type="button" class="chart-range ${state.chartRange === r ? "active" : ""}" data-range="${r}">${r}</button>`).join("")}
         </div>
-        <span class="chart-hint">Open · close jobs + live snapshots</span>
+        <span class="chart-hint">${isRealTypeTab ? "Synced from Robinhood MCP · open/close jobs" : "Open · close jobs + live snapshots"}</span>
       </div>
     </div>` : ""}
 
@@ -479,11 +531,17 @@ function renderMain() {
           <h2>Real Robinhood Portfolio</h2>
           <div class="stat-value mono">$0.00</div>
           <div class="stat-sub">Cash $0.00 · Invested $0.00</div>
-          <div class="stat-sub" style="color:#64748b">No positions (empty state)</div>
-        ` : isRealTypeTab && currentTab.real_trading_enabled ? `
+          <div class="stat-sub" style="color:#64748b">Sync from MCP or enable real trading intents</div>
+          <div class="stat-sub" style="margin-top:8px;font-size:0.72rem">
+            <code>npm run real:enable</code> · then ask Grok to sync the Agentic portfolio
+          </div>
+        ` : isRealTypeTab ? `
           <h2>Real Robinhood Portfolio</h2>
-          <div class="stat-value mono">Real data enabled via MCP (fetch not yet wired for this session)</div>
-          <div class="stat-sub">Set real_trading_enabled: true on the tab to populate from Robinhood</div>
+          <div class="stat-value mono">${fmtMoney(portfolio.totalValue || 0)}</div>
+          <div class="stat-sub">Cash ${fmtMoney(portfolio.cash || 0)} · Invested ${fmtMoney(portfolio.invested || 0)}</div>
+          <div class="stat-sub">Account ${maskAccount(portfolio.brokerAccount)} · ${realEnabled ? "intents ON" : "view only"}</div>
+          ${portfolio.lastSynced ? `<div class="stat-sub">Synced ${new Date(portfolio.lastSynced).toLocaleString()}</div>` : `<div class="stat-sub" style="color:#fbbf24">Not synced yet — ask Grok to pull Agentic positions</div>`}
+          ${(thisTabData.pendingCount || 0) > 0 ? `<div class="stat-sub" style="color:#fbbf24;margin-top:6px">${thisTabData.pendingCount} pending intent(s) awaiting MCP confirmation</div>` : ""}
         ` : `
           <h2>${thisTabData.enabled ? "Paper Portfolio" : "Portfolio Value"}</h2>
           <div class="stat-value mono">${fmtMoney(thisTabData.portfolio ? thisTabData.portfolio.totalValue : 0)}</div>
@@ -505,24 +563,25 @@ function renderMain() {
     </div>
 
     <div class="grid grid-2" style="margin-bottom:16px">
-      ${!isRealTypeTab ? `
       <div class="card">
         <h2>Allocation vs Target</h2>
-        <div class="allocation-row" style="font-size:0.72rem;color:var(--muted);padding-bottom:4px;border:none">
-          <div>Asset</div><div>Actual vs Target</div><div style="text-align:right">Actual</div><div style="text-align:right">Target</div><div style="text-align:right">Drift</div>
-        </div>
-        ${allocationRows(thisTabData.drift ? thisTabData.drift.vsRecommended : [], thisTabData.portfolio ? thisTabData.portfolio.positions : [])}
-        ${action}
+        ${isRealTypeTab && !hasRealPortfolio ? `
+          <p class="stat-sub">Sync the Agentic portfolio (or fund it) to compare actual vs target allocation.</p>
+        ` : `
+          <div class="allocation-row" style="font-size:0.72rem;color:var(--muted);padding-bottom:4px;border:none">
+            <div>Asset</div><div>Actual vs Target</div><div style="text-align:right">Actual</div><div style="text-align:right">Target</div><div style="text-align:right">Drift</div>
+          </div>
+          ${allocationRows(thisTabData.drift ? thisTabData.drift.vsRecommended : [], thisTabData.portfolio ? thisTabData.portfolio.positions : [])}
+          ${action}
+        `}
       </div>
-      ` : `<div class="card"><h2>Real Allocation</h2><p class="stat-sub">Real trading disabled for this tab (real_trading_enabled: false). Real data view-only from MCP when enabled on the tab.</p></div>`}
       <div class="card">
-        ${showEmptyReal ? `
+        ${isRealTypeTab ? `
           <h2>Real Positions</h2>
-          <p class="stat-sub" style="margin: 12px 0;">No positions</p>
-          <div style="font-size:0.8rem;color:#64748b">Real Robinhood positions (view only). Real trading is OFF for this tab in config. Currently empty (0 dollars, no positions) as requested.</div>
-        ` : isRealTypeTab && currentTab.real_trading_enabled ? `
-          <h2>Real Positions</h2>
-          <p class="stat-sub">Real trading enabled on this tab - live MCP portfolio would display here.</p>
+          ${hasRealPortfolio
+            ? positionsTable(thisTabData.portfolio ? thisTabData.portfolio.positions : [])
+            : `<p class="stat-sub" style="margin: 12px 0;">No positions synced</p>
+               <div style="font-size:0.8rem;color:#64748b">Ask Grok: “sync my Agentic portfolio into the macro dashboard”.</div>`}
         ` : `
           <h2>Positions</h2>
           ${positionsTable(thisTabData.portfolio ? thisTabData.portfolio.positions : [])}
@@ -548,11 +607,23 @@ function renderMain() {
       </div>
     </div>
 
+    ${isRealTypeTab ? `
+    <div class="card" style="margin-bottom:16px">
+      <h2>Pending Real Intents</h2>
+      <p class="stat-sub" style="margin-bottom:8px;font-size:0.75rem">
+        Jobs write intents only — never auto-place. Confirm in Grok (Robinhood MCP) before money moves.
+        ${realEnabled ? "" : " · Intent generation is OFF (<code>npm run real:enable</code>)."}
+      </p>
+      ${pendingOrdersTable(thisTabData.pendingOrders || [])}
+    </div>
+    ` : ""}
+
     <div class="grid grid-2" style="margin-bottom:16px">
       <div class="card">
         ${isRealTypeTab ? `
-          <h2>Real Trades</h2>
-          <p class="stat-sub" style="margin-bottom:8px;font-size:0.75rem">Real trading is disabled for this tab (real_trading_enabled: false in the config list). Paper simulation trade history is shown on the Paper tab.</p>
+          <h2>Real Trades (filled)</h2>
+          <p class="stat-sub" style="margin-bottom:8px;font-size:0.75rem">Logged after you confirm MCP placement. Paper history is on the Paper tab.</p>
+          ${tradesTable(thisTabData.trades || [], "No real fills logged yet.")}
         ` : `
           <h2>Paper Trades</h2>
           <p class="stat-sub" style="margin-bottom:8px;font-size:0.75rem">Paper simulation trades executed by the regime jobs.</p>

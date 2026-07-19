@@ -68,6 +68,7 @@ All runtime state is stored in `data/regime.db` (SQLite, WAL mode). The file is 
 | `portfolio_meta` | Per-tab scalars: cash, starting capital, last synced |
 | `positions` | Current holdings (shares, avg cost) per tab + symbol |
 | `trades` | Immutable append-only trade log |
+| `pending_orders` | Real-trade intents awaiting MCP confirmation |
 | `equity_snapshots` | Post-rebalance portfolio state (value, weights, return %) |
 | `strategy_log` | One row per job run: regime tier, targets, prices, action, rationale |
 | `chart_snapshots` | Intraday value snapshots (throttled to 5 min) for the portfolio chart |
@@ -88,6 +89,65 @@ curl -X POST http://localhost:3847/api/live-prices \
 ```
 
 Prices are written to the `quotes` table as `source=mcp` and take priority over Yahoo for both the dashboard display and the regime job. They include a `fetched_at` timestamp — the job will fall back to a fresh Yahoo fetch if MCP prices are older than 8 minutes.
+
+## Real trading (MCP-assisted, confirm-before-place)
+
+Real orders **never auto-execute**. The open/close job only queues **pending intents**. You (or Grok in this chat) place them via Robinhood MCP on your **Agentic** account after explicit confirmation.
+
+### One-time setup
+
+1. Fund a Robinhood **Agentic** account and connect it to Grok’s Robinhood MCP.
+2. Enable intent generation:
+
+```bash
+npm run real:enable
+# optional: ROBINHOOD_ACCOUNT=951185404 npm run real:enable
+```
+
+3. Sync live positions/cash from MCP into the dashboard (ask Grok, or POST):
+
+```bash
+curl -X POST http://localhost:3847/api/real/sync-portfolio \
+  -H "Content-Type: application/json" \
+  -d '{
+    "account_number": "951185404",
+    "account_name": "Agentic",
+    "cash": 5000,
+    "holdings": [
+      {"symbol": "QQQ", "shares": 2.5, "avg_cost": 480},
+      {"symbol": "GLD", "shares": 1.0, "avg_cost": 220},
+      {"symbol": "USO", "shares": 0, "avg_cost": 0}
+    ]
+  }'
+```
+
+### Daily flow
+
+1. `job:open` / `job:close` scores the regime and runs paper fills as before.
+2. If real trading is enabled and drift &gt; 5%, the job **writes rows to `pending_orders`** (no broker call).
+3. Review: `npm run real:pending` or the Real tab on the dashboard.
+4. In Grok: *“review and place pending real trades on my Agentic account”* — Grok calls `review_equity_order` then, after you confirm, `place_equity_order`.
+5. Mark filled + re-sync portfolio (Grok can do this, or):
+
+```bash
+python3 scripts/real_trade.py --mark-placed 12 --order-id <robinhood-order-uuid>
+# then re-sync portfolio via MCP
+```
+
+MCP place payloads (for debugging):
+
+```bash
+npm run real:payloads
+```
+
+| Script | Description |
+|--------|-------------|
+| `real:enable` | Turn on real-tab intent generation |
+| `real:disable` | Turn off + cancel open intents |
+| `real:pending` | List pending intents |
+| `real:payloads` | Print MCP `place_equity_order` args |
+
+**Account rule:** only the Agentic account (`agentic_allowed=true`) can be used for MCP orders. Default account number is `951185404` (override with `ROBINHOOD_ACCOUNT`).
 
 ## Scheduled jobs
 
@@ -137,6 +197,10 @@ The source plist templates in `scripts/launchd/` use a placeholder and are safe 
 | `job:close` | Run close regime job |
 | `schedule:install` | Install macOS launchd schedule |
 | `paper:init` | Reset paper portfolio and clear all history |
+| `real:enable` | Enable real-tab intent queue (confirm-before-place) |
+| `real:disable` | Disable real trading + cancel pending |
+| `real:pending` | List pending real intents |
+| `real:payloads` | Print MCP place payloads for pending intents |
 
 ## Project layout
 
@@ -152,6 +216,7 @@ macro/
 │   ├── db.py              # SQLite access layer (Python)
 │   ├── daily_regime_job.py
 │   ├── paper_trade.py
+│   ├── real_trade.py          # MCP-assisted real intents (no auto-place)
 │   ├── daily_regime_agent_prompt.txt
 │   ├── install_schedule.sh
 │   └── launchd/           # LaunchAgent templates
@@ -172,6 +237,12 @@ macro/
 | `GET /api/portfolio?tab=paper` | Raw portfolio for a tab |
 | `POST /api/portfolio` | Update manual holdings (blocked in paper mode) |
 | `POST /api/live-prices` | Push MCP prices to the quotes table |
+| `GET /api/pending-orders` | Real-trade intents (`?status=pending\|all`) |
+| `POST /api/pending-orders/:id/placed` | Mark intent filled after MCP place |
+| `POST /api/pending-orders/:id/cancel` | Cancel one intent |
+| `POST /api/pending-orders/cancel-all` | Cancel all pending intents |
+| `POST /api/real/sync-portfolio` | Push Robinhood portfolio snapshot into real tab |
+| `POST /api/real/config` | Enable/disable real intent generation |
 
 ## Security & git
 
