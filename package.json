@@ -6,12 +6,14 @@
   "scripts": {
     "dev": "concurrently \"node server.js\" \"vite\"",
     "server": "node server.js",
+    "start": "NODE_ENV=production node server.js",
     "job:open": "python3 scripts/daily_regime_job.py --session open",
     "job:close": "python3 scripts/daily_regime_job.py --session close",
-    "schedule:install": "bash scripts/install_schedule.sh",
+    "schedule:remove": "bash scripts/remove_legacy_schedule.sh",
     "paper:init": "python3 scripts/paper_trade.py --init",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",

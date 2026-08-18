@@ -3,6 +3,7 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { createScheduler, REGIME_SCHEDULE } from "./scheduler.js";
 import {
   getDb,
   loadTabConfig,
@@ -30,6 +31,8 @@ const SYMBOLS = ["QQQ", "USO", "GLD", "^VIX", "CL=F", "GC=F", "BTC-USD"];
 const ASSETS = ["QQQ", "USO", "GLD"];
 const TIERS_PATH = path.join(__dirname, "data/tiers.json");
 const REPORTS_DIR = path.join(__dirname, "logs", "reports");
+
+let scheduler;
 
 // Ensure DB schema is initialised on startup
 getDb();
@@ -272,6 +275,11 @@ function getTodaySessions(rows, today) {
   };
 }
 
+function isSessionComplete(date, session) {
+  const rows = loadStrategyLog("paper");
+  return Boolean(getTodaySessions(rows, date)[session.toLowerCase()]);
+}
+
 // ---------------------------------------------------------------------------
 // LLM report loader (DB first, fallback to .md files on disk)
 // ---------------------------------------------------------------------------
@@ -453,11 +461,15 @@ async function buildDashboardPayload() {
     tabs,
     regime: globalRegime,
     schedule: {
-      timezone: "America/New_York",
-      jobs: [
-        { session: "Open", time: "09:30", purpose: "Pre-open rebalance check" },
-        { session: "Close", time: "16:00", purpose: "End-of-day drift check" },
-      ],
+      ...(scheduler?.getStatus() ?? {
+        enabled: false,
+        timezone: "America/New_York",
+        jobs: REGIME_SCHEDULE.map((job) => ({
+          session: job.label,
+          time: job.time,
+          purpose: job.purpose,
+        })),
+      }),
     },
     market: {
       quotes,
@@ -480,7 +492,12 @@ app.use(express.json());
 app.get("/api/health", (_req, res) => {
   const db = getDb();
   const tabCount = db.prepare("SELECT COUNT(*) AS n FROM tab_config").get().n;
-  res.json({ ok: true, db: "sqlite", tabs: tabCount });
+  res.json({
+    ok: true,
+    db: "sqlite",
+    tabs: tabCount,
+    scheduler: scheduler?.getStatus() ?? { enabled: false },
+  });
 });
 
 app.get("/api/dashboard", async (_req, res) => {
@@ -575,6 +592,21 @@ if (process.env.NODE_ENV === "production") {
   });
 }
 
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   console.log(`Regime dashboard API http://localhost:${PORT}`);
 });
+
+scheduler = createScheduler({
+  rootDir: __dirname,
+  isSessionComplete,
+});
+scheduler.start();
+
+function shutdown(signal) {
+  console.log(`[server] Received ${signal}, shutting down`);
+  scheduler.stop();
+  httpServer.close(() => process.exit(0));
+}
+
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));

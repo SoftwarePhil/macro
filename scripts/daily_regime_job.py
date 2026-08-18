@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daily 3-tier regime job — run at market open and market close."""
+"""Daily 3-tier regime job run by the Node server scheduler."""
 
 from __future__ import annotations
 

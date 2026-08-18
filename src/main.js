@@ -421,6 +421,14 @@ function tradesTable(trades) {
   `;
 }
 
+function scheduleSummary(schedule) {
+  if (!schedule?.enabled) return "In-app scheduler offline";
+  if (schedule.activeSession) {
+    return `In-app scheduler running ${schedule.activeSession.toLowerCase()} job`;
+  }
+  return "In-app scheduler online · 9:30 AM open · 4:00 PM close (ET, weekdays)";
+}
+
 function renderMain() {
   const d = state.data;
   const { regime, market } = d;
@@ -440,7 +448,7 @@ function renderMain() {
       <div>
         <h1>3-Tier Regime Dashboard</h1>
         <p>${regime.logDate ? `Last update: ${regime.logDate} ${regime.session || ""}` : "Awaiting first regime log"} · ${thisTabData.portfolio?.accountName || 'Account'}</p>
-        <p style="margin-top:4px;font-size:0.8rem">Jobs: 9:30 AM open · 4:00 PM close (ET, weekdays)</p>
+        <p style="margin-top:4px;font-size:0.8rem">${scheduleSummary(d.schedule)}</p>
       </div>
       <div class="header-actions">
         ${!isRealTypeTab && thisTabData.enabled ? `<span class="badge paper">Paper · $${(thisTabData.startingCapital / 1000).toFixed(0)}k mock</span>` : ""}
@@ -469,7 +477,7 @@ function renderMain() {
         <div class="chart-ranges">
           ${["1D", "1W", "1M", "ALL"].map((r) => `<button type="button" class="chart-range ${state.chartRange === r ? "active" : ""}" data-range="${r}">${r}</button>`).join("")}
         </div>
-        <span class="chart-hint">Open · close jobs + live snapshots</span>
+        <span class="chart-hint">In-app open/close runs + live snapshots</span>
       </div>
     </div>` : ""}
 
