@@ -599,15 +599,19 @@ const httpServer = app.listen(PORT, () => {
   console.log(`Regime dashboard API http://localhost:${PORT}`);
 });
 
-scheduler = createScheduler({
-  rootDir: __dirname,
-  isSessionComplete,
-});
-scheduler.start();
+const schedulerEnabled = process.env.SCHEDULER_ENABLED !== "false";
+
+if (schedulerEnabled) {
+  scheduler = createScheduler({
+    rootDir: __dirname,
+    isSessionComplete,
+  });
+  scheduler.start();
+}
 
 function shutdown(signal) {
   console.log(`[server] Received ${signal}, shutting down`);
-  scheduler.stop();
+  scheduler?.stop();
   httpServer.close(() => process.exit(0));
 }
 
