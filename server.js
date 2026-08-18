@@ -275,9 +275,12 @@ function getTodaySessions(rows, today) {
   };
 }
 
-function isSessionComplete(date, session) {
-  const rows = loadStrategyLog("paper");
-  return Boolean(getTodaySessions(rows, date)[session.toLowerCase()]);
+function isSessionComplete(dateKey, session) {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT 1 FROM strategy_log WHERE tab_id=? AND date=? AND session=? LIMIT 1")
+    .get("paper", dateKey, String(session).toLowerCase());
+  return Boolean(row);
 }
 
 // ---------------------------------------------------------------------------
