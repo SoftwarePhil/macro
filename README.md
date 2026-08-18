@@ -2,7 +2,7 @@
 
 A local dashboard for monitoring a 3-tier macro regime strategy across **GLD**, **QQQ**, **USO**, and **CASH**. It scores the current regime, picks a target allocation within per-tier ranges, suggests rebalances, and supports **paper trading** with a Robinhood-style portfolio value chart.
 
-No brokerage credentials are stored in this repo. Market data comes from public Yahoo Finance endpoints. Scheduled jobs run locally via macOS `launchd`. All state is stored in a local SQLite database (`data/regime.db`).
+No brokerage credentials are stored in this repo. Market data comes from public Yahoo Finance endpoints. The long-running Node server owns the in-app weekday schedule. All state is stored in a local SQLite database (`data/regime.db`).
 
 ## Strategy overview
 
@@ -19,21 +19,56 @@ Default midpoints and full range definitions live in `data/tiers.json`. Rebalanc
 ## Quick start
 
 ```bash
+cp .env.example .env
 npm install
 npm run paper:init      # create fresh DB + $100k paper portfolio
-npm run dev             # API on :3847, UI on :5173
+npm run dev             # API + scheduler on :3847, UI on :5173
 ```
 
 - **UI:** http://localhost:5173
 - **API:** http://localhost:3847
 
-`npm run dev` starts the Express API and Vite dev server together. Vite proxies `/api` to the API.
+`npm run dev` starts the Express API, its in-app scheduler, and the Vite dev server together. Vite proxies `/api` to the API. Keep this process running for scheduled jobs.
+
+For one always-running production process:
+
+```bash
+npm run build
+npm start
+```
+
+The production server serves the dashboard and API on http://localhost:3847 and keeps the scheduler running in the same process.
+
+## Environment
+
+Copy `.env.example` to `.env` and set local values there. The Node server and direct Python jobs load `.env` automatically. Variables already exported in the shell take precedence.
+
+For development-only overrides, create `.env.local`. It is loaded automatically by `npm run dev`, the Node server, and direct Python jobs. Precedence is shell environment > `.env.local` > `.env`.
+
+```bash
+cp .env.example .env
+cp .env.example .env.local
+# Edit .env.local with machine-specific values or secrets.
+npm run dev
+```
+
+Common settings:
+
+- `PORT` — API port, default `3847`
+- `SCHEDULER_ENABLED` — set to `false` to run the server without scheduled jobs
+- `SCHEDULE_TIMEZONE` — scheduler timezone, default `America/New_York`
+- `SCHEDULER_TICK_MS` — scheduler check interval, default `15000`
+- `SCHEDULER_RETRY_MS` — failed-job retry delay, default `300000`
+- `PYTHON_BIN` — Python executable, default `python3`
+- `XAI_API_KEY` — optional key for direct Grok reports
+- `XAI_MODEL` — xAI model, default `grok-3-latest`
+
+`.env` and `.env.local` are ignored by Git. Never commit secrets; use `.env.example` for safe defaults and variable names.
 
 ### Requirements
 
 - Node.js 20+
 - Python 3.11+ (stdlib only — no pip deps)
-- macOS (for optional `launchd` scheduling)
 
 ## Dashboard features
 
@@ -41,7 +76,7 @@ npm run dev             # API on :3847, UI on :5173
 - Drift warnings when any position exceeds a 5% band
 - Market snapshot (QQQ, USO, GLD, VIX, WTI, gold, BTC) — Yahoo Finance with optional MCP override
 - Regime rationale, strategy log, and LLM report viewer
-- **Paper mode:** mock portfolio, auto-fills on open/close jobs, P&L tracking
+- **Paper mode:** mock portfolio, auto-fills on in-app open/close jobs, P&L tracking
 - **Portfolio chart:** Robinhood-style SVG line with hover crosshair and time ranges (1D / 1W / 1M / ALL)
 - **Job run history:** every scheduled and manual execution logged with tier, action, LLM status, trade count, duration
 
@@ -50,7 +85,7 @@ npm run dev             # API on :3847, UI on :5173
 Paper mode is configured in the database. Initialize or reset via:
 
 ```bash
-npm run paper:init                          # $100k cash, clears all history
+npm run paper:init                          # reset the paper account to $100k cash
 npm run paper:init -- --capital 50000       # custom starting capital
 npm run paper:init -- --start-date 2026-01-01
 ```
@@ -89,9 +124,9 @@ curl -X POST http://localhost:3847/api/live-prices \
 
 Prices are written to the `quotes` table as `source=mcp` and take priority over Yahoo for both the dashboard display and the regime job. They include a `fetched_at` timestamp — the job will fall back to a fresh Yahoo fetch if MCP prices are older than 8 minutes.
 
-## Scheduled jobs
+## In-app Scheduler
 
-Jobs run **weekdays** at market open and close (Eastern Time):
+The Node server owns scheduling. No cron or LaunchAgent installation is required. While the server is running, it executes jobs **weekdays** at market open and close (Eastern Time):
 
 | Session | Time (ET) | Purpose |
 |---------|-----------|---------|
@@ -99,13 +134,30 @@ Jobs run **weekdays** at market open and close (Eastern Time):
 | Close | 4:00 PM | End-of-day drift check vs same-day open |
 
 ```bash
-# Install launchd agents (macOS)
-npm run schedule:install
+# macOS only: remove old LaunchAgents from an earlier installation
+npm run schedule:remove
+
+# Development: API, scheduler, and Vite UI
+npm run dev
+
+# Production: build once, then keep this process running
+npm run build
+npm start
 
 # Run manually
 npm run job:open
 npm run job:close
 ```
+
+The scheduler checks for due work every 15 seconds, runs only one regime job at a time, and treats an existing paper-tab `strategy_log` row for a date/session as completed. If the server starts after a scheduled time on a weekday, it catches up missing sessions in order. Failed jobs are retried after five minutes. Scheduler state and the next run are available from `GET /api/health` and the dashboard header.
+
+Configuration overrides:
+
+- `SCHEDULER_ENABLED` — set to `false` to disable the in-app scheduler
+- `SCHEDULE_TIMEZONE` — defaults to `America/New_York`
+- `SCHEDULER_TICK_MS` — defaults to `15000`
+- `SCHEDULER_RETRY_MS` — defaults to `300000`
+- `PYTHON_BIN` — defaults to `python3`
 
 Each job run:
 1. Fetches quotes (MCP cache first, Yahoo fallback)
@@ -118,12 +170,14 @@ Each job run:
 **XAI API key** (for direct LLM calls from the daily job):
 
 ```bash
-echo 'xai-yourkeyhere' > data/xai_api_key.txt
-chmod 600 data/xai_api_key.txt
-npm run schedule:install   # injects key into launchd plists
+# Add this to .env
+XAI_API_KEY=xai-yourkeyhere
+
+# Then start the server
+npm start                   # loads .env and passes the key to the job
 ```
 
-The source plist templates in `scripts/launchd/` use a placeholder and are safe to commit.
+Alternatively, export `XAI_API_KEY` in the environment used to start the server. The older `data/xai_api_key.txt` fallback is still supported, but `.env` is preferred. Neither file nor the environment variable is committed.
 
 ## npm scripts
 
@@ -131,18 +185,22 @@ The source plist templates in `scripts/launchd/` use a placeholder and are safe 
 |--------|-------------|
 | `dev` | API + Vite dev servers |
 | `server` | API only (port 3847) |
+| `start` | Production dashboard server + in-app scheduler |
 | `build` | Production frontend build |
 | `preview` | Preview production build |
 | `job:open` | Run open regime job |
 | `job:close` | Run close regime job |
-| `schedule:install` | Install macOS launchd schedule |
-| `paper:init` | Reset paper portfolio and clear all history |
+| `schedule:remove` | Remove legacy macOS LaunchAgents |
+| `paper:init` | Initialize/reset the paper portfolio |
+| `test` | Run scheduler regression tests |
 
 ## Project layout
 
 ```
-macro/
-├── server.js              # Express API — quotes, portfolio, chart, job runs
+regime-dashboard/
+├── server.js              # Express API — quotes, portfolio, chart, job runs, scheduler startup
+├── env.js                 # Local .env loader
+├── scheduler.js           # In-app weekday regime scheduler
 ├── db.js                  # SQLite access layer (Node)
 ├── src/
 │   ├── main.js            # Dashboard UI (vanilla JS)
@@ -153,19 +211,21 @@ macro/
 │   ├── daily_regime_job.py
 │   ├── paper_trade.py
 │   ├── daily_regime_agent_prompt.txt
-│   ├── install_schedule.sh
-│   └── launchd/           # LaunchAgent templates
+│   └── remove_legacy_schedule.sh
+├── test/
+│   ├── env.test.js
+│   └── scheduler.test.js
 └── data/
     ├── tiers.json         # Tier range definitions (committed)
     ├── regime.db          # Runtime state — gitignored
-    └── xai_api_key.txt    # xAI key for launchd — gitignored
+    └── xai_api_key.txt    # xAI key for the in-app job runner — gitignored
 ```
 
 ## API
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /api/health` | Health check — reports DB status and tab count |
+| `GET /api/health` | Health check — reports DB, tab count, and scheduler status |
 | `GET /api/dashboard` | Full dashboard payload including job runs |
 | `GET /api/job-runs?limit=N` | Job execution history (newest first, max 500) |
 | `GET /api/log?tab=paper` | Strategy log rows for a tab |
@@ -178,11 +238,12 @@ macro/
 **Never committed:**
 
 - API keys, OAuth tokens, or brokerage credentials
+- `.env` and other local environment files
 - `data/regime.db` and WAL files — all runtime state
-- `data/xai_api_key.txt` — xAI key for launchd
+- `data/xai_api_key.txt` — xAI key for the in-app job runner
 - `logs/` — runtime output
 
-`.gitignore` covers all of these. The xAI key is read by `scripts/install_schedule.sh` at install time and injected into the launchd plist. The source templates contain only a placeholder.
+`.gitignore` covers all of these. The xAI key is read by the long-running server and passed only to the spawned job process.
 
 Robinhood MCP / Agentic account integration is configured separately in Grok — not in this repository.
 
