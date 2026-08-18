@@ -48,7 +48,7 @@ test("catches up open before close and runs each session once", async () => {
   assert.deepEqual(calls, ["open", "close"]);
 });
 
-test("does not rerun sessions already recorded in SQLite", async () => {
+test("does not rerun sessions already marked complete", async () => {
   const calls = [];
   const completed = new Set(["open", "close"]);
   const scheduler = createScheduler({
