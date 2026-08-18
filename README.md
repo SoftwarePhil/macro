@@ -19,15 +19,16 @@ Default midpoints and full range definitions live in `data/tiers.json`. Rebalanc
 ## Quick start
 
 ```bash
+cp .env.example .env
 npm install
 npm run paper:init      # create fresh DB + $100k paper portfolio
-npm run dev             # API on :3847, UI on :5173
+npm run dev             # API + scheduler on :3847, UI on :5173
 ```
 
 - **UI:** http://localhost:5173
 - **API:** http://localhost:3847
 
-`npm run dev` starts the Express API, its in-app scheduler, and the Vite dev server together. Vite proxies `/api` to the API.
+`npm run dev` starts the Express API, its in-app scheduler, and the Vite dev server together. Vite proxies `/api` to the API. Keep this process running for scheduled jobs.
 
 For one always-running production process:
 
@@ -36,7 +37,33 @@ npm run build
 npm start
 ```
 
-The production server serves the dashboard and API on http://localhost:3847.
+The production server serves the dashboard and API on http://localhost:3847 and keeps the scheduler running in the same process.
+
+## Environment
+
+Copy `.env.example` to `.env` and set local values there. The Node server and direct Python jobs load `.env` automatically. Variables already exported in the shell take precedence.
+
+For development-only overrides, create `.env.local`. It is loaded automatically by `npm run dev`, the Node server, and direct Python jobs. Precedence is shell environment > `.env.local` > `.env`.
+
+```bash
+cp .env.example .env
+cp .env.example .env.local
+# Edit .env.local with machine-specific values or secrets.
+npm run dev
+```
+
+Common settings:
+
+- `PORT` — API port, default `3847`
+- `SCHEDULER_ENABLED` — set to `false` to run the server without scheduled jobs
+- `SCHEDULE_TIMEZONE` — scheduler timezone, default `America/New_York`
+- `SCHEDULER_TICK_MS` — scheduler check interval, default `15000`
+- `SCHEDULER_RETRY_MS` — failed-job retry delay, default `300000`
+- `PYTHON_BIN` — Python executable, default `python3`
+- `XAI_API_KEY` — optional key for direct Grok reports
+- `XAI_MODEL` — xAI model, default `grok-3-latest`
+
+`.env` and `.env.local` are ignored by Git. Never commit secrets; use `.env.example` for safe defaults and variable names.
 
 ### Requirements
 
@@ -58,7 +85,7 @@ The production server serves the dashboard and API on http://localhost:3847.
 Paper mode is configured in the database. Initialize or reset via:
 
 ```bash
-npm run paper:init                          # $100k cash, clears all history
+npm run paper:init                          # reset the paper account to $100k cash
 npm run paper:init -- --capital 50000       # custom starting capital
 npm run paper:init -- --start-date 2026-01-01
 ```
@@ -97,9 +124,9 @@ curl -X POST http://localhost:3847/api/live-prices \
 
 Prices are written to the `quotes` table as `source=mcp` and take priority over Yahoo for both the dashboard display and the regime job. They include a `fetched_at` timestamp — the job will fall back to a fresh Yahoo fetch if MCP prices are older than 8 minutes.
 
-## In-app scheduler
+## In-app Scheduler
 
-The always-running Node server runs jobs **weekdays** at market open and close (Eastern Time):
+The Node server owns scheduling. No cron or LaunchAgent installation is required. While the server is running, it executes jobs **weekdays** at market open and close (Eastern Time):
 
 | Session | Time (ET) | Purpose |
 |---------|-----------|---------|
@@ -107,10 +134,14 @@ The always-running Node server runs jobs **weekdays** at market open and close (
 | Close | 4:00 PM | End-of-day drift check vs same-day open |
 
 ```bash
-# Remove legacy LaunchAgents once, if they were previously installed
+# macOS only: remove old LaunchAgents from an earlier installation
 npm run schedule:remove
 
-# Start the server and its in-app scheduler
+# Development: API, scheduler, and Vite UI
+npm run dev
+
+# Production: build once, then keep this process running
+npm run build
 npm start
 
 # Run manually
@@ -118,7 +149,15 @@ npm run job:open
 npm run job:close
 ```
 
-The scheduler checks for due work every 15 seconds, runs only one regime job at a time, and treats an existing paper-tab strategy-log row for a date/session as completed. If the server starts after a scheduled time on a weekday, it catches up missing sessions in order. Failed jobs are retried after five minutes. Set `SCHEDULER_TICK_MS`, `SCHEDULER_RETRY_MS`, `SCHEDULE_TIMEZONE`, or `PYTHON_BIN` to override the defaults.
+The scheduler checks for due work every 15 seconds, runs only one regime job at a time, and treats an existing paper-tab `strategy_log` row for a date/session as completed. If the server starts after a scheduled time on a weekday, it catches up missing sessions in order. Failed jobs are retried after five minutes. Scheduler state and the next run are available from `GET /api/health` and the dashboard header.
+
+Configuration overrides:
+
+- `SCHEDULER_ENABLED` — set to `false` to disable the in-app scheduler
+- `SCHEDULE_TIMEZONE` — defaults to `America/New_York`
+- `SCHEDULER_TICK_MS` — defaults to `15000`
+- `SCHEDULER_RETRY_MS` — defaults to `300000`
+- `PYTHON_BIN` — defaults to `python3`
 
 Each job run:
 1. Fetches quotes (MCP cache first, Yahoo fallback)
@@ -131,12 +170,14 @@ Each job run:
 **XAI API key** (for direct LLM calls from the daily job):
 
 ```bash
-echo 'xai-yourkeyhere' > data/xai_api_key.txt
-chmod 600 data/xai_api_key.txt
-npm start                   # server passes the key to the in-app job
+# Add this to .env
+XAI_API_KEY=xai-yourkeyhere
+
+# Then start the server
+npm start                   # loads .env and passes the key to the job
 ```
 
-Alternatively, export `XAI_API_KEY` in the environment used to start the server. The key file and environment variable are never committed.
+Alternatively, export `XAI_API_KEY` in the environment used to start the server. The older `data/xai_api_key.txt` fallback is still supported, but `.env` is preferred. Neither file nor the environment variable is committed.
 
 ## npm scripts
 
@@ -150,13 +191,15 @@ Alternatively, export `XAI_API_KEY` in the environment used to start the server.
 | `job:open` | Run open regime job |
 | `job:close` | Run close regime job |
 | `schedule:remove` | Remove legacy macOS LaunchAgents |
-| `paper:init` | Reset paper portfolio and clear all history |
+| `paper:init` | Initialize/reset the paper portfolio |
+| `test` | Run scheduler regression tests |
 
 ## Project layout
 
 ```
-macro/
+regime-dashboard/
 ├── server.js              # Express API — quotes, portfolio, chart, job runs, scheduler startup
+├── env.js                 # Local .env loader
 ├── scheduler.js           # In-app weekday regime scheduler
 ├── db.js                  # SQLite access layer (Node)
 ├── src/
@@ -169,6 +212,9 @@ macro/
 │   ├── paper_trade.py
 │   ├── daily_regime_agent_prompt.txt
 │   └── remove_legacy_schedule.sh
+├── test/
+│   ├── env.test.js
+│   └── scheduler.test.js
 └── data/
     ├── tiers.json         # Tier range definitions (committed)
     ├── regime.db          # Runtime state — gitignored
@@ -192,6 +238,7 @@ macro/
 **Never committed:**
 
 - API keys, OAuth tokens, or brokerage credentials
+- `.env` and other local environment files
 - `data/regime.db` and WAL files — all runtime state
 - `data/xai_api_key.txt` — xAI key for the in-app job runner
 - `logs/` — runtime output

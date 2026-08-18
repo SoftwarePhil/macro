@@ -3,6 +3,7 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import "./env.js";
 import { createScheduler, REGIME_SCHEDULE } from "./scheduler.js";
 import {
   getDb,
