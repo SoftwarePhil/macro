@@ -148,7 +148,7 @@ export function createScheduler({
 
   function runJob(job, dateKey) {
     const state = states.get(job.session);
-    if (active || state.running) return Promise.resolve(null);
+    if (stopped || active || state.running) return Promise.resolve(null);
 
     state.running = true;
     state.lastAttemptAt = now().getTime();
@@ -292,6 +292,9 @@ export function createScheduler({
       if (timer) clearInterval(timer);
       timer = null;
       if (active?.child) active.child.kill("SIGTERM");
+      for (const state of states.values()) {
+        state.running = false;
+      }
       active = null;
       console.log("[scheduler] In-app scheduler stopped");
     },

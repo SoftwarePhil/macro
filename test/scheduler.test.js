@@ -66,3 +66,54 @@ test("does not rerun sessions already recorded in SQLite", async () => {
 
   assert.deepEqual(calls, []);
 });
+
+test("clears a session running state when stopped before close", async () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => {};
+
+  const scheduler = createScheduler({
+    rootDir: process.cwd(),
+    timeZone: "America/New_York",
+    now: () => AFTER_CLOSE_ET,
+    isSessionComplete: () => false,
+    spawnJob: () => child,
+  });
+
+  scheduler.start();
+  assert.equal(scheduler.getStatus().jobs.find((job) => job.session === "Open").running, true);
+
+  scheduler.stop();
+
+  const status = scheduler.getStatus();
+  assert.equal(status.activeSession, null);
+  assert.equal(status.jobs.every((job) => !job.running), true);
+});
+
+test("does not start another job after stopping an in-progress check", async () => {
+  const calls = [];
+  let child;
+  const scheduler = createScheduler({
+    rootDir: process.cwd(),
+    timeZone: "America/New_York",
+    now: () => AFTER_CLOSE_ET,
+    isSessionComplete: () => false,
+    spawnJob: (_pythonBin, args) => {
+      child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => queueMicrotask(() => child.emit("close", 0, null));
+      calls.push(args.at(-1));
+      return child;
+    },
+  });
+
+  scheduler.start();
+  await waitFor(() => calls.length === 1);
+
+  scheduler.stop();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(calls, ["open"]);
+});
