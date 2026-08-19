@@ -1,6 +1,8 @@
 .DS_Store
 node_modules/
 dist/
+.next/
+tsconfig.tsbuildinfo
 
 # Secrets and local env (never commit)
 .env

@@ -22,13 +22,12 @@ Default midpoints and full range definitions live in `data/tiers.json`. Rebalanc
 cp .env.example .env
 npm install
 npm run paper:init      # create fresh DB + $100k paper portfolio
-npm run dev             # API + scheduler on :3847, UI on :5173
+npm run dev             # Next.js UI + API + scheduler on :3847
 ```
 
-- **UI:** http://localhost:5173
-- **API:** http://localhost:3847
+- **UI and API:** http://localhost:3847
 
-`npm run dev` starts the Express API, its in-app scheduler, and the Vite dev server together. Vite proxies `/api` to the API. Keep this process running for scheduled jobs.
+`npm run dev` starts the Next.js app, its API routes, and the in-app scheduler together. Keep this process running for scheduled jobs.
 
 For one always-running production process:
 
@@ -109,7 +108,7 @@ All runtime state is stored in `data/regime.db` (SQLite, WAL mode). The file is 
 | `llm_reports` | Full LLM report text per tab / date / session |
 | `job_runs` | Execution history: status, duration, trade count, LLM status, error messages |
 
-The shared schema and all access functions are in `scripts/db.py` (Python) and `db.js` (Node). Both processes share the same file safely via WAL mode.
+The shared schema and access functions are in `scripts/db.py` (Python) and `lib/db.ts` (Node). Both processes share the same file safely via WAL mode.
 
 ## Real prices via Robinhood MCP
 
@@ -126,7 +125,7 @@ Prices are written to the `quotes` table as `source=mcp` and take priority over 
 
 ## In-app Scheduler
 
-The Node server owns scheduling. No cron or LaunchAgent installation is required. While the server is running, it executes jobs **weekdays** at market open and close (Eastern Time):
+The Next.js Node server owns scheduling. No cron or LaunchAgent installation is required. While the server is running, it executes jobs **weekdays** at market open and close (Eastern Time):
 
 | Session | Time (ET) | Purpose |
 |---------|-----------|---------|
@@ -137,7 +136,7 @@ The Node server owns scheduling. No cron or LaunchAgent installation is required
 # macOS only: remove old LaunchAgents from an earlier installation
 npm run schedule:remove
 
-# Development: API, scheduler, and Vite UI
+# Development: Next.js UI, API routes, and scheduler
 npm run dev
 
 # Production: build once, then keep this process running
@@ -183,11 +182,12 @@ Alternatively, export `XAI_API_KEY` in the environment used to start the server.
 
 | Script | Description |
 |--------|-------------|
-| `dev` | API + Vite dev servers |
-| `server` | API only (port 3847) |
+| `dev` | Next.js dashboard, API routes, and scheduler |
+| `server` | Next.js development server |
 | `start` | Production dashboard server + in-app scheduler |
-| `build` | Production frontend build |
-| `preview` | Preview production build |
+| `build` | Production Next.js build |
+| `preview` | Start the production Next.js build |
+| `typecheck` | Run the TypeScript compiler without emitting files |
 | `job:open` | Run open regime job |
 | `job:close` | Run close regime job |
 | `schedule:remove` | Remove legacy macOS LaunchAgents |
@@ -198,14 +198,21 @@ Alternatively, export `XAI_API_KEY` in the environment used to start the server.
 
 ```
 regime-dashboard/
-├── server.js              # Express API — quotes, portfolio, chart, job runs, scheduler startup
-├── env.js                 # Local .env loader
-├── scheduler.js           # In-app weekday regime scheduler
-├── db.js                  # SQLite access layer (Node)
-├── src/
-│   ├── main.js            # Dashboard UI (vanilla JS)
-│   ├── portfolioChart.js  # Robinhood-style SVG chart
-│   └── style.css
+├── app/
+│   ├── api/                # Next.js API route handlers
+│   ├── components/         # React/TypeScript dashboard and chart
+│   ├── globals.css         # Dashboard styles
+│   ├── layout.tsx          # App Router layout and metadata
+│   └── page.tsx            # Dashboard route
+├── lib/
+│   ├── dashboard.ts        # Dashboard payload and quote computation
+│   ├── db.ts               # SQLite access layer (Node)
+│   ├── env.ts              # Local .env loader
+│   ├── scheduler.ts        # In-app weekday regime scheduler
+│   └── types.ts             # Shared TypeScript domain types
+├── next.config.ts          # Next.js configuration
+├── instrumentation.ts      # Starts the in-app scheduler with Next.js
+├── tsconfig.json            # TypeScript configuration
 ├── scripts/
 │   ├── db.py              # SQLite access layer (Python)
 │   ├── daily_regime_job.py
@@ -213,8 +220,8 @@ regime-dashboard/
 │   ├── daily_regime_agent_prompt.txt
 │   └── remove_legacy_schedule.sh
 ├── test/
-│   ├── env.test.js
-│   └── scheduler.test.js
+│   ├── env.test.ts
+│   └── scheduler.test.ts
 └── data/
     ├── tiers.json         # Tier range definitions (committed)
     ├── regime.db          # Runtime state — gitignored
