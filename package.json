@@ -4,24 +4,30 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"node server.js\" \"vite\"",
-    "server": "node server.js",
-    "start": "NODE_ENV=production node server.js",
+    "dev": "next dev",
+    "server": "next dev",
+    "start": "NODE_ENV=production next start",
     "job:open": "python3 scripts/daily_regime_job.py --session open",
     "job:close": "python3 scripts/daily_regime_job.py --session close",
     "schedule:remove": "bash scripts/remove_legacy_schedule.sh",
     "paper:init": "python3 scripts/paper_trade.py --init",
-    "build": "vite build",
-    "preview": "vite preview",
-    "test": "node --test"
+    "build": "next build",
+    "preview": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1",
-    "cors": "^2.8.5",
-    "express": "^4.21.2"
+    "next": "^16.3.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
-    "concurrently": "^9.1.2",
-    "vite": "^6.2.0"
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
   }
 }

@@ -40,6 +40,11 @@ body {
   padding: 24px 20px 48px;
 }
 
+button.small {
+  padding: 3px 8px;
+  font-size: 0.72rem;
+}
+
 header.top {
   display: flex;
   justify-content: space-between;
@@ -186,6 +191,17 @@ button:hover {
   border-bottom: none;
 }
 
+.allocation-heading {
+  font-size: 0.72rem;
+  color: var(--muted);
+  padding-bottom: 4px;
+  border-bottom: none;
+}
+
+.allocation-heading > div:nth-child(n+3) {
+  text-align: right;
+}
+
 .sym {
   font-weight: 700;
   font-size: 0.95rem;
@@ -289,6 +305,16 @@ button:hover {
   border-radius: 4px;
   margin-left: 6px;
   vertical-align: middle;
+}
+
+.market-source {
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+.market-source.live-source {
+  color: #86efac;
 }
 
 .tabs {
@@ -454,6 +480,26 @@ td.mono {
   padding: 24px;
   width: min(480px, 100%);
   box-shadow: var(--shadow);
+}
+
+.report-modal {
+  max-width: 900px;
+  width: 95%;
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.report-subtitle,
+.report-note {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.report-note {
+  margin: 8px 0 0;
+  font-size: 0.7rem;
 }
 
 .modal h2 {

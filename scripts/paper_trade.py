@@ -312,7 +312,7 @@ def execute_rebalance(
 
 
 # ---------------------------------------------------------------------------
-# Read helpers (used by server.js via JSON API, not directly)
+# Read helpers retained for direct Python jobs and compatibility with the API layer
 # ---------------------------------------------------------------------------
 
 def load_trades(limit: int = 50) -> list[dict]:

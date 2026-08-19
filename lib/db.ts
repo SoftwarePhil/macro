@@ -1,19 +1,19 @@
-/**
- * Shared SQLite access layer for the regime dashboard (Node / server.js side).
- *
- * Uses better-sqlite3 (synchronous API — safe for Express since all DB
- * operations are sub-millisecond local reads on WAL mode).
- *
- * The DB file lives at  data/regime.db  relative to the repo root.
- * Schema is identical to scripts/db.py — both processes share the same file.
- */
-
 import Database from "better-sqlite3";
-import path from "path";
-import { fileURLToPath } from "url";
+import path from "node:path";
+import type {
+  ChartPoint,
+  EquitySnapshot,
+  Holding,
+  JobRun,
+  LlmReport,
+  QuoteRow,
+  RawPortfolio,
+  StrategyLogRow,
+  TabConfig,
+  TradeRow,
+} from "./types";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = path.join(__dirname, "data", "regime.db");
+const DB_PATH = path.join(process.cwd(), "data", "regime.db");
 
 const SCHEMA = `
 PRAGMA journal_mode=WAL;
@@ -121,6 +121,16 @@ CREATE TABLE IF NOT EXISTS chart_snapshots (
 );
 CREATE INDEX IF NOT EXISTS chart_tab_ts ON chart_snapshots(tab_id, ts DESC);
 
+CREATE TABLE IF NOT EXISTS llm_reports (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    tab_id      TEXT NOT NULL DEFAULT 'paper',
+    date        TEXT NOT NULL,
+    session     TEXT NOT NULL,
+    filename    TEXT,
+    report_text TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 CREATE TABLE IF NOT EXISTS job_runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at      TEXT NOT NULL,
@@ -142,36 +152,30 @@ CREATE TABLE IF NOT EXISTS job_runs (
 );
 CREATE INDEX IF NOT EXISTS job_runs_started ON job_runs(started_at DESC);
 
-CREATE TABLE IF NOT EXISTS llm_reports (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    tab_id      TEXT NOT NULL DEFAULT 'paper',
+CREATE TABLE IF NOT EXISTS scheduler_claims (
     date        TEXT NOT NULL,
     session     TEXT NOT NULL,
-    filename    TEXT,
-    report_text TEXT NOT NULL,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    owner       TEXT NOT NULL,
+    claimed_at  INTEGER NOT NULL,
+    PRIMARY KEY (date, session)
 );
 `;
 
-let _db = null;
+let db: Database.Database | null = null;
 
-export function getDb() {
-  if (!_db) {
-    _db = new Database(DB_PATH);
-    _db.exec(SCHEMA);
+export function getDb(): Database.Database {
+  if (!db) {
+    db = new Database(DB_PATH);
+    db.exec(SCHEMA);
   }
-  return _db;
+  return db;
 }
 
-// ---------------------------------------------------------------------------
-// tab_config
-// ---------------------------------------------------------------------------
-
-export function loadTabConfig() {
-  return getDb().prepare("SELECT * FROM tab_config ORDER BY tab_id").all();
+export function loadTabConfig(): TabConfig[] {
+  return getDb().prepare("SELECT * FROM tab_config ORDER BY tab_id").all() as TabConfig[];
 }
 
-export function upsertTabConfig(tab) {
+export function upsertTabConfig(tab: Partial<TabConfig> & { id?: string }): void {
   getDb().prepare(`
     INSERT INTO tab_config
         (tab_id, label, type, enabled, real_trading_enabled,
@@ -201,13 +205,7 @@ export function upsertTabConfig(tab) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// quotes  (Node server writes Yahoo fetches here; Python reads these too)
-// ---------------------------------------------------------------------------
-
-const QUOTE_STALENESS_MS = 10 * 60 * 1000; // 10 minutes
-
-export function upsertQuotesBatch(quotesMap) {
+export function upsertQuotesBatch(quotesMap: Record<string, Record<string, unknown>>): void {
   const now = new Date().toISOString();
   const insert = getDb().prepare(`
     INSERT INTO quotes (symbol, price, change_pct, market_state, fetched_at, source)
@@ -217,61 +215,44 @@ export function upsertQuotesBatch(quotesMap) {
         market_state=excluded.market_state,
         fetched_at=excluded.fetched_at, source=excluded.source
   `);
-  const tx = getDb().transaction((map) => {
-    for (const [sym, q] of Object.entries(map)) {
+  const tx = getDb().transaction((map: Record<string, Record<string, unknown>>) => {
+    for (const [symbol, quote] of Object.entries(map)) {
+      const marketState = String(quote.marketState ?? quote.market_state ?? "UNKNOWN");
       insert.run({
-        symbol: sym,
-        price: Number(q.price || 0),
-        change_pct: Number(q.changePct ?? q.change_pct ?? 0),
-        market_state: q.marketState || q.market_state || "UNKNOWN",
+        symbol,
+        price: Number(quote.price || 0),
+        change_pct: Number(quote.changePct ?? quote.change_pct ?? 0),
+        market_state: marketState,
         fetched_at: now,
-        source: (q.marketState || q.market_state || "").includes("MCP") ? "mcp" : "yahoo",
+        source: marketState.includes("MCP") ? "mcp" : "yahoo",
       });
     }
   });
   tx(quotesMap);
 }
 
-export function loadQuotes() {
-  const rows = getDb().prepare("SELECT * FROM quotes").all();
-  const map = {};
-  for (const r of rows) map[r.symbol] = r;
-  return map;
+export function loadQuotes(): Record<string, QuoteRow> {
+  const rows = getDb().prepare("SELECT * FROM quotes").all() as QuoteRow[];
+  return Object.fromEntries(rows.map((row) => [row.symbol, row]));
 }
 
-/** Returns true if all core symbols have fresh quotes (within staleness window). */
-export function quotesAreFresh(symbols = ["QQQ", "USO", "GLD"]) {
-  const now = Date.now();
-  for (const sym of symbols) {
-    const row = getDb().prepare(
-      "SELECT fetched_at FROM quotes WHERE symbol=?"
-    ).get(sym);
-    if (!row) return false;
-    const age = now - new Date(row.fetched_at).getTime();
-    if (age > QUOTE_STALENESS_MS) return false;
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// portfolio_meta + positions
-// ---------------------------------------------------------------------------
-
-export function loadPortfolio(tabId = "paper") {
-  const db = getDb();
-  const meta = db.prepare("SELECT * FROM portfolio_meta WHERE tab_id=?").get(tabId);
-  const positions = db.prepare(
-    "SELECT symbol, shares, avg_cost FROM positions WHERE tab_id=?"
-  ).all(tabId);
+export function loadPortfolio(tabId = "paper"): RawPortfolio {
+  const database = getDb();
+  const meta = database.prepare("SELECT * FROM portfolio_meta WHERE tab_id=?").get(tabId) as
+    | Omit<RawPortfolio, "holdings">
+    | undefined;
+  const holdings = database.prepare(
+    "SELECT symbol, shares, avg_cost FROM positions WHERE tab_id=?",
+  ).all(tabId) as Holding[];
   if (!meta) return { tab_id: tabId, cash: 0, holdings: [], starting_capital: 0 };
-  return { ...meta, holdings: positions };
+  return { ...meta, holdings };
 }
 
-export function savePortfolio(portfolio, tabId = "paper") {
-  const db = getDb();
+export function savePortfolio(portfolio: Partial<RawPortfolio>, tabId = "paper"): void {
+  const database = getDb();
   const now = new Date().toISOString();
-  const tx = db.transaction(() => {
-    db.prepare(`
+  const tx = database.transaction(() => {
+    database.prepare(`
       INSERT INTO portfolio_meta
           (tab_id, account_name, source, mode, starting_capital,
            started_at, cash, last_synced)
@@ -292,47 +273,39 @@ export function savePortfolio(portfolio, tabId = "paper") {
       cash: Number(portfolio.cash || 0),
       last_synced: now,
     });
-    for (const h of (portfolio.holdings || [])) {
-      db.prepare(`
+    for (const holding of portfolio.holdings || []) {
+      database.prepare(`
         INSERT INTO positions (tab_id, symbol, shares, avg_cost)
         VALUES (@tab_id, @symbol, @shares, @avg_cost)
         ON CONFLICT(tab_id, symbol) DO UPDATE SET
             shares=excluded.shares, avg_cost=excluded.avg_cost
       `).run({
         tab_id: tabId,
-        symbol: h.symbol,
-        shares: Number(h.shares || 0),
-        avg_cost: Number(h.avg_cost || 0),
+        symbol: holding.symbol,
+        shares: Number(holding.shares || 0),
+        avg_cost: Number(holding.avg_cost || 0),
       });
     }
   });
   tx();
 }
 
-// ---------------------------------------------------------------------------
-// trades
-// ---------------------------------------------------------------------------
-
-export function loadTrades(tabId = "paper", limit = 50) {
+export function loadTrades(tabId = "paper", limit = 50): TradeRow[] {
   return getDb().prepare(`
     SELECT timestamp AS "Timestamp", date AS "Date", session AS "Session",
            symbol AS "Symbol", side AS "Side", shares AS "Shares",
            price AS "Price", notional AS "Notional", reason AS "Reason"
     FROM trades WHERE tab_id=? ORDER BY id DESC LIMIT ?
-  `).all(tabId, limit);
+  `).all(tabId, limit) as TradeRow[];
 }
 
-export function countTrades(tabId = "paper") {
-  return getDb().prepare(
-    "SELECT COUNT(*) AS n FROM trades WHERE tab_id=?"
-  ).get(tabId).n;
+export function countTrades(tabId = "paper"): number {
+  return Number((getDb().prepare(
+    "SELECT COUNT(*) AS n FROM trades WHERE tab_id=?",
+  ).get(tabId) as { n: number }).n);
 }
 
-// ---------------------------------------------------------------------------
-// equity_snapshots
-// ---------------------------------------------------------------------------
-
-export function loadEquitySnapshots(tabId = "paper", limit = 60) {
+export function loadEquitySnapshots(tabId = "paper", limit = 60): EquitySnapshot[] {
   const rows = getDb().prepare(`
     SELECT date AS "Date", session AS "Session",
            total_value AS "Total_Value", cash AS "Cash",
@@ -340,15 +313,11 @@ export function loadEquitySnapshots(tabId = "paper", limit = 60) {
            return_pct AS "Return_pct", tier AS "Tier"
     FROM equity_snapshots
     WHERE tab_id=? ORDER BY id DESC LIMIT ?
-  `).all(tabId, limit);
+  `).all(tabId, limit) as EquitySnapshot[];
   return rows.slice().reverse();
 }
 
-// ---------------------------------------------------------------------------
-// strategy_log
-// ---------------------------------------------------------------------------
-
-export function loadStrategyLog(tabId = "paper") {
+export function loadStrategyLog(tabId = "paper"): StrategyLogRow[] {
   return getDb().prepare(`
     SELECT
         date AS "Date", session AS "Session",
@@ -367,29 +336,24 @@ export function loadStrategyLog(tabId = "paper") {
         suggested_action     AS "Suggested_Action",
         rebalance_note       AS "Rebalance_Note"
     FROM strategy_log WHERE tab_id=? ORDER BY id ASC
-  `).all(tabId);
+  `).all(tabId) as StrategyLogRow[];
 }
-
-// ---------------------------------------------------------------------------
-// chart_snapshots
-// ---------------------------------------------------------------------------
 
 const CHART_SNAP_INTERVAL_MS = 5 * 60 * 1000;
 const CHART_SNAP_MAX = 2000;
 
-export function recordChartSnapshot(value, returnPct, tabId = "paper") {
-  const db = getDb();
+export function recordChartSnapshot(value: number, returnPct: number, tabId = "paper"): void {
+  const database = getDb();
   const nowMs = Date.now();
-  const last = db.prepare(
-    "SELECT ts FROM chart_snapshots WHERE tab_id=? ORDER BY ts DESC LIMIT 1"
-  ).get(tabId);
-  if (last && (nowMs - last.ts) < CHART_SNAP_INTERVAL_MS) return;
-  const tx = db.transaction(() => {
-    db.prepare(
-      "INSERT INTO chart_snapshots (tab_id, ts, value, return_pct) VALUES (?,?,?,?)"
+  const last = database.prepare(
+    "SELECT ts FROM chart_snapshots WHERE tab_id=? ORDER BY ts DESC LIMIT 1",
+  ).get(tabId) as { ts: number } | undefined;
+  if (last && nowMs - last.ts < CHART_SNAP_INTERVAL_MS) return;
+  const tx = database.transaction(() => {
+    database.prepare(
+      "INSERT INTO chart_snapshots (tab_id, ts, value, return_pct) VALUES (?,?,?,?)",
     ).run(tabId, nowMs, Math.round(value * 100) / 100, Math.round(returnPct * 100) / 100);
-    // Prune beyond cap
-    db.prepare(`
+    database.prepare(`
       DELETE FROM chart_snapshots
       WHERE tab_id=? AND id NOT IN (
           SELECT id FROM chart_snapshots WHERE tab_id=? ORDER BY ts DESC LIMIT ?
@@ -399,19 +363,52 @@ export function recordChartSnapshot(value, returnPct, tabId = "paper") {
   tx();
 }
 
-export function loadChartSnapshots(tabId = "paper") {
+export function loadChartSnapshots(tabId = "paper"): ChartPoint[] {
   return getDb().prepare(`
     SELECT ts, value, return_pct AS returnPct
     FROM chart_snapshots WHERE tab_id=? ORDER BY ts ASC
-  `).all(tabId);
+  `).all(tabId) as ChartPoint[];
 }
 
-// ---------------------------------------------------------------------------
-// job_runs
-// ---------------------------------------------------------------------------
+export function loadJobRuns(limit = 100): JobRun[] {
+  return getDb().prepare(`
+    SELECT id, started_at, finished_at, duration_s, session, tab_id,
+           status, tier, strength, action, paper_enabled,
+           llm_status, trade_count, portfolio_value, error_message, report_file, llm_report_id
+    FROM job_runs ORDER BY id DESC LIMIT ?
+  `).all(limit) as JobRun[];
+}
 
-export function insertJobRun(run) {
-  const stmt = getDb().prepare(`
+export function loadJobRunById(jobRunId: number): JobRun | null {
+  const row = getDb().prepare(`
+    SELECT id, started_at, finished_at, duration_s, session, tab_id,
+           status, tier, strength, action, paper_enabled,
+           llm_status, trade_count, portfolio_value, error_message, report_file, llm_report_id
+    FROM job_runs WHERE id=?
+  `).get(jobRunId) as JobRun | undefined;
+  return row || null;
+}
+
+export function loadLlmReportById(reportId: number): LlmReport | null {
+  const row = getDb().prepare(`
+    SELECT id, tab_id, date, session, filename, report_text AS text, created_at
+    FROM llm_reports WHERE id=?
+  `).get(reportId) as LlmReport | undefined;
+  return row || null;
+}
+
+export function loadLatestLlmReport(tabId: string): LlmReport | null {
+  const row = getDb().prepare(`
+    SELECT tab_id, date, session, filename, report_text AS text
+    FROM llm_reports WHERE tab_id=?
+    ORDER BY date DESC, CASE WHEN session='close' THEN 1 ELSE 0 END DESC
+    LIMIT 1
+  `).get(tabId) as LlmReport | undefined;
+  return row || null;
+}
+
+export function insertJobRun(run: Partial<JobRun> & { started_at: string; finished_at: string; session: string }): number {
+  const result = getDb().prepare(`
     INSERT INTO job_runs
         (started_at, finished_at, duration_s, session, tab_id,
          status, tier, strength, action, paper_enabled,
@@ -419,76 +416,72 @@ export function insertJobRun(run) {
     VALUES (@started_at, @finished_at, @duration_s, @session, @tab_id,
             @status, @tier, @strength, @action, @paper_enabled,
             @llm_status, @trade_count, @portfolio_value, @error_message, @report_file, @llm_report_id)
-  `);
-  const result = stmt.run({
-    started_at:      run.started_at,
-    finished_at:     run.finished_at,
-    duration_s:      Number(run.duration_s ?? 0),
-    session:         run.session,
-    tab_id:          run.tab_id ?? "paper",
-    status:          run.status ?? "ok",
-    tier:            run.tier ?? null,
-    strength:        run.strength ?? null,
-    action:          run.action ?? null,
-    paper_enabled:   run.paper_enabled ? 1 : 0,
-    llm_status:      run.llm_status ?? null,
-    trade_count:     Number(run.trade_count ?? 0),
+  `).run({
+    started_at: run.started_at,
+    finished_at: run.finished_at,
+    duration_s: Number(run.duration_s ?? 0),
+    session: run.session,
+    tab_id: run.tab_id ?? "paper",
+    status: run.status ?? "ok",
+    tier: run.tier ?? null,
+    strength: run.strength ?? null,
+    action: run.action ?? null,
+    paper_enabled: run.paper_enabled ? 1 : 0,
+    llm_status: run.llm_status ?? null,
+    trade_count: Number(run.trade_count ?? 0),
     portfolio_value: run.portfolio_value ?? null,
-    error_message:   run.error_message ?? null,
-    report_file:     run.report_file ?? null,
-    llm_report_id:   run.llm_report_id ?? null,
+    error_message: run.error_message ?? null,
+    report_file: run.report_file ?? null,
+    llm_report_id: run.llm_report_id ?? null,
   });
-  return result.lastInsertRowid;
+  return Number(result.lastInsertRowid);
 }
 
-export function loadJobRuns(limit = 100) {
-  return getDb().prepare(`
-    SELECT id, started_at, finished_at, duration_s, session, tab_id,
-           status, tier, strength, action, paper_enabled,
-           llm_status, trade_count, portfolio_value, error_message, report_file, llm_report_id
-    FROM job_runs ORDER BY id DESC LIMIT ?
-  `).all(limit);
-}
-
-// ---------------------------------------------------------------------------
-// llm_reports
-// ---------------------------------------------------------------------------
-
-export function insertLlmReport(tabId, date, session, text, filename = null) {
+export function insertLlmReport(
+  tabId: string,
+  date: string,
+  session: string,
+  text: string,
+  filename: string | null = null,
+): number {
   const result = getDb().prepare(`
     INSERT INTO llm_reports (tab_id, date, session, filename, report_text)
     VALUES (@tab_id, @date, @session, @filename, @text)
   `).run({ tab_id: tabId, date, session: session.toLowerCase(), filename, text });
-  return result.lastInsertRowid;
+  return Number(result.lastInsertRowid);
 }
 
-// Backward-compatible alias
 export const upsertLlmReport = insertLlmReport;
 
-export function loadLlmReportById(reportId) {
-  const row = getDb().prepare(`
-    SELECT id, tab_id, date, session, filename, report_text AS text, created_at
-    FROM llm_reports WHERE id=?
-  `).get(reportId);
-  return row || null;
+const SCHEDULER_CLAIM_STALE_MS = 15 * 60 * 1000;
+
+export function claimSchedulerSession(
+  date: string,
+  session: string,
+  owner: string,
+  now = Date.now(),
+  staleAfterMs = SCHEDULER_CLAIM_STALE_MS,
+): boolean {
+  const result = getDb().prepare(`
+    INSERT INTO scheduler_claims (date, session, owner, claimed_at)
+    VALUES (@date, @session, @owner, @claimed_at)
+    ON CONFLICT(date, session) DO UPDATE SET
+      owner=excluded.owner,
+      claimed_at=excluded.claimed_at
+    WHERE scheduler_claims.owner=@owner
+       OR scheduler_claims.claimed_at < @stale_at
+  `).run({
+    date,
+    session: session.toLowerCase(),
+    owner,
+    claimed_at: now,
+    stale_at: now - staleAfterMs,
+  });
+  return result.changes > 0;
 }
 
-export function loadJobRunById(jobRunId) {
-  const row = getDb().prepare(`
-    SELECT id, started_at, finished_at, duration_s, session, tab_id,
-           status, tier, strength, action, paper_enabled,
-           llm_status, trade_count, portfolio_value, error_message, report_file, llm_report_id
-    FROM job_runs WHERE id=?
-  `).get(jobRunId);
-  return row || null;
-}
-
-export function loadLatestLlmReport(tabId) {
-  const row = getDb().prepare(`
-    SELECT tab_id, date, session, filename, report_text AS text
-    FROM llm_reports WHERE tab_id=?
-    ORDER BY date DESC, CASE WHEN session='close' THEN 1 ELSE 0 END DESC
-    LIMIT 1
-  `).get(tabId);
-  return row || null;
+export function releaseSchedulerSession(date: string, session: string, owner: string): void {
+  getDb().prepare(
+    "DELETE FROM scheduler_claims WHERE date=? AND session=? AND owner=?",
+  ).run(date, session.toLowerCase(), owner);
 }

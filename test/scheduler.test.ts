@@ -1,17 +1,20 @@
-import { EventEmitter } from "events";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createScheduler } from "../scheduler.js";
+import { createScheduler } from "../lib/scheduler";
 
 const AFTER_CLOSE_ET = new Date("2026-08-17T20:30:00.000Z");
 
-function fakeSpawn(calls, completed) {
-  return (_pythonBin, args) => {
-    const child = new EventEmitter();
-    child.stdout = new EventEmitter();
-    child.stderr = new EventEmitter();
-    child.kill = () => {};
-    const session = args.at(-1);
+class MockChild extends EventEmitter {
+  stdout = new EventEmitter();
+  stderr = new EventEmitter();
+  kill = () => true;
+}
+
+function fakeSpawn(calls: string[], completed: Set<string>) {
+  return (_pythonBin: string, args: string[]) => {
+    const child = new MockChild();
+    const session = args.at(-1) as string;
     calls.push(session);
     queueMicrotask(() => {
       completed.add(session);
@@ -21,7 +24,7 @@ function fakeSpawn(calls, completed) {
   };
 }
 
-async function waitFor(predicate, timeoutMs = 500) {
+async function waitFor(predicate: () => boolean, timeoutMs = 500) {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     if (Date.now() >= deadline) throw new Error("Timed out waiting for scheduler");
@@ -30,8 +33,8 @@ async function waitFor(predicate, timeoutMs = 500) {
 }
 
 test("catches up open before close and runs each session once", async () => {
-  const calls = [];
-  const completed = new Set();
+  const calls: string[] = [];
+  const completed = new Set<string>();
   const scheduler = createScheduler({
     rootDir: process.cwd(),
     timeZone: "America/New_York",
@@ -49,7 +52,7 @@ test("catches up open before close and runs each session once", async () => {
 });
 
 test("does not rerun sessions already marked complete", async () => {
-  const calls = [];
+  const calls: string[] = [];
   const completed = new Set(["open", "close"]);
   const scheduler = createScheduler({
     rootDir: process.cwd(),
@@ -68,10 +71,7 @@ test("does not rerun sessions already marked complete", async () => {
 });
 
 test("clears a session running state when stopped before close", async () => {
-  const child = new EventEmitter();
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
-  child.kill = () => {};
+  const child = new MockChild();
 
   const scheduler = createScheduler({
     rootDir: process.cwd(),
@@ -82,7 +82,7 @@ test("clears a session running state when stopped before close", async () => {
   });
 
   scheduler.start();
-  assert.equal(scheduler.getStatus().jobs.find((job) => job.session === "Open").running, true);
+  assert.equal(scheduler.getStatus().jobs.find((job) => job.session === "Open")?.running, true);
 
   scheduler.stop();
 
@@ -92,19 +92,20 @@ test("clears a session running state when stopped before close", async () => {
 });
 
 test("does not start another job after stopping an in-progress check", async () => {
-  const calls = [];
-  let child;
+  const calls: string[] = [];
+  let child: MockChild;
   const scheduler = createScheduler({
     rootDir: process.cwd(),
     timeZone: "America/New_York",
     now: () => AFTER_CLOSE_ET,
     isSessionComplete: () => false,
-    spawnJob: (_pythonBin, args) => {
-      child = new EventEmitter();
-      child.stdout = new EventEmitter();
-      child.stderr = new EventEmitter();
-      child.kill = () => queueMicrotask(() => child.emit("close", 0, null));
-      calls.push(args.at(-1));
+    spawnJob: (_pythonBin: string, args: string[]) => {
+      child = new MockChild();
+      child.kill = () => {
+        queueMicrotask(() => child.emit("close", 0, null));
+        return true;
+      };
+      calls.push(args.at(-1) as string);
       return child;
     },
   });
@@ -116,4 +117,36 @@ test("does not start another job after stopping an in-progress check", async () 
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(calls, ["open"]);
+});
+
+test("coordinates catch-up work across scheduler instances", async () => {
+  const calls: string[] = [];
+  const completed = new Set<string>();
+  const claims = new Set<string>();
+  const claimSession = (date: string, session: string) => {
+    const key = `${date}:${session}`;
+    if (claims.has(key)) return false;
+    claims.add(key);
+    return true;
+  };
+  const options = {
+    rootDir: process.cwd(),
+    timeZone: "America/New_York",
+    now: () => AFTER_CLOSE_ET,
+    tickMs: 10,
+    isSessionComplete: (_date: string, session: string) => completed.has(session),
+    claimSession,
+    spawnJob: fakeSpawn(calls, completed),
+  };
+  const first = createScheduler({ ...options, ownerId: "first" });
+  const second = createScheduler({ ...options, ownerId: "second" });
+
+  first.start();
+  second.start();
+  await waitFor(() => calls.length === 2);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  first.stop();
+  second.stop();
+
+  assert.deepEqual(calls, ["open", "close"]);
 });

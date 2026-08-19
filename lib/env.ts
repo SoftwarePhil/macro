@@ -1,12 +1,10 @@
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-
-const ROOT = path.dirname(fileURLToPath(import.meta.url));
+import fs from "node:fs";
+import path from "node:path";
+const ROOT = process.cwd();
 const ENV_FILE = path.join(ROOT, ".env");
 const LOCAL_ENV_FILE = path.join(ROOT, ".env.local");
 
-function parseValue(value) {
+function parseValue(value: string): string {
   const trimmed = value.trim();
   if (
     trimmed.length >= 2 &&
@@ -18,7 +16,7 @@ function parseValue(value) {
   return trimmed;
 }
 
-export function loadEnv(filePath = ENV_FILE) {
+export function loadEnv(filePath = ENV_FILE): void {
   try {
     const contents = fs.readFileSync(filePath, "utf8");
     for (const line of contents.split(/\r?\n/)) {
@@ -33,14 +31,12 @@ export function loadEnv(filePath = ENV_FILE) {
       process.env[key] = parseValue(trimmed.slice(separator + 1));
     }
   } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 
-export function loadEnvFiles(filePaths = [LOCAL_ENV_FILE, ENV_FILE]) {
+export function loadEnvFiles(filePaths = [LOCAL_ENV_FILE, ENV_FILE]): void {
   for (const filePath of filePaths) loadEnv(filePath);
 }
 
-// Load local overrides first so the base .env cannot replace them. Shell values
-// are already present in process.env and are never overwritten.
 loadEnvFiles();
