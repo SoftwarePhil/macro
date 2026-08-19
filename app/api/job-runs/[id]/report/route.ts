@@ -3,11 +3,12 @@ import { loadJobRunById, loadLlmReportById } from "@/lib/db";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export function GET(
+export async function GET(
   _request: Request,
-  { params }: { params: { id: string } },
+  { params }: { params: Promise<{ id: string }> },
 ) {
-  const jobId = Number(params.id);
+  const { id } = await params;
+  const jobId = Number(id);
   if (!Number.isFinite(jobId) || jobId <= 0) {
     return Response.json({ error: "invalid job id" }, { status: 400 });
   }
