@@ -17,9 +17,12 @@ export async function POST(request: Request) {
     const value = typeof rawValue === "number" ? { price: rawValue } : rawValue;
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;
     const quote = value as Record<string, unknown>;
+    const price = Number(quote.price);
+    const changePct = Number(quote.changePct ?? quote.change_pct ?? 0);
+    if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(changePct)) continue;
     normalized[symbol] = {
-      price: Number(quote.price ?? quote),
-      changePct: Number(quote.changePct ?? quote.change_pct ?? 0),
+      price,
+      changePct,
       marketState: "LIVE_ROBINHOOD_MCP",
     };
   }
